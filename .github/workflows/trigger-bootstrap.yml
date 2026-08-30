@@ -1,0 +1,13 @@
+name: Trigger bootstrap
+on: push
+permissions:
+  actions: write
+  contents: read
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start V11.4.8 bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bootstrap-v1148.yml --repo "$GITHUB_REPOSITORY" --ref main
