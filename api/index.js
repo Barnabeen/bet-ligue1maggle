@@ -7,7 +7,8 @@ async function openRemoteBrowser(){
   const direct = process.env.BROWSERLESS_WS;
   const token = process.env.BROWSERLESS_TOKEN;
   if (!direct && !token) throw new Error('BROWSERLESS_NOT_CONFIGURED');
-  const ws = direct || `wss://production-sfo.browserless.io?token=${encodeURIComponent(token)}&blockAds=true`;
+  const base = direct || `wss://production-sfo.browserless.io?token=${encodeURIComponent(token)}&blockAds=true`;
+  const ws = /[?&]timeout=\d+/i.test(base) ? base : `${base}${base.includes('?')?'&':'?'}timeout=120000`;
   return chromium.connectOverCDP(ws,{timeout:20000});
 }
 async function getPage(browser){
@@ -518,7 +519,7 @@ async function clickMarkedTarget(page,method){
 
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.14',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.15',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
   diagnostic.inspect=await inspectEventAndChoose(page,b);
   if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
@@ -645,7 +646,7 @@ async function createBulletin(page,inputBets){
 
 
 
-export const config = { maxDuration: 180 };
+export const config = { maxDuration: 300 };
 
 function isTargetClosedError(e){
   return /Target page, context or browser has been closed|Target closed|Browser has been closed|Protocol error.*closed/i.test(String(e?.message||e||''));
@@ -654,7 +655,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.14',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.15',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -667,7 +668,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.14',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.15',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
