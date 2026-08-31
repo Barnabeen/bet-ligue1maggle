@@ -1,0 +1,178 @@
+name: Upgrade V11.4.16
+on:
+  push:
+    paths:
+      - '.v11416-trigger'
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V11.4.16
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p=Path('api/index.js')
+          s=p.read_text()
+          s=s.replace('11.4.15','11.4.16')
+
+          start=s.find('async function ensureUniqueSelection(page,b){')
+          end=s.find('\nasync function selectionConfirmed(page,b){', start)
+          if start < 0 or end < 0:
+              raise SystemExit('ensureUniqueSelection block not found')
+
+          fast=r'''async function fastCartCount(page){
+  return page.evaluate(()=>{
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+    const badge=[...document.querySelectorAll('[data="app-cart|nbreParisPanier"], .tabs-cart_number')]
+      .map(x=>parseInt(norm(x.innerText||x.textContent||'').replace(/\D/g,''),10))
+      .find(Number.isFinite);
+    if(Number.isFinite(badge)) return badge;
+    const cards=[...document.querySelectorAll('.cart-item.simple')];
+    const signatures=new Set(cards.map(card=>{
+      const input=card.querySelector('input');
+      const id=input?.id||input?.getAttribute('name')||'';
+      const text=norm(card.innerText||card.textContent||'');
+      return id?`id:${id}`:`txt:${text}`;
+    }));
+    return signatures.size;
+  });
+}
+
+async function waitCartAtLeast(page,minCount,timeoutMs){
+  const end=Date.now()+timeoutMs;
+  let last=0;
+  while(Date.now()<end){
+    if(page.isClosed()) throw new Error('BROWSERLESS_PAGE_CLOSED_DURING_CART_WAIT');
+    last=await fastCartCount(page);
+    if(last>=minCount) return last;
+    await page.waitForTimeout(90);
+  }
+  return await fastCartCount(page);
+}
+
+async function ensureUniqueSelection(page,b){
+  if(await findExactCartCard(page,b)) return {via:'cart-existing'};
+
+  const diagnostic={version:'11.4.16',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const before=await fastCartCount(page);
+  diagnostic.before={count:before};
+
+  let inspect=await inspectEventAndChoose(page,b);
+  diagnostic.inspect=inspect;
+  if(!inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
+  if(inspect?.chosen?.active) return {via:'active-existing',diagnostic};
+
+  // V11.4.16 fast path: a successful click must increase the empty/reset cart.
+  // We no longer rescan the whole Parions DOM 5 times after every click.
+  for(const [method,waitMs] of [['locator',1200],['pointer',850],['dom-events',850]]){
+    inspect=await inspectEventAndChoose(page,b); // also re-marks the current Angular node
+    if(!inspect?.ok) break;
+    if(inspect?.chosen?.active) return {via:'active-before-'+method,diagnostic};
+    if(await findExactCartCard(page,b)) return {via:'cart-before-'+method,diagnostic};
+
+    const click=await clickMarkedTarget(page,method);
+    const attempt={method,click};
+    diagnostic.attempts.push(attempt);
+    if(!click?.ok) continue;
+
+    const after=await waitCartAtLeast(page,before+1,waitMs);
+    attempt.afterCount=after;
+    if(after>=before+1) return {via:'cart-count-'+method,diagnostic};
+
+    // One semantic check only before trying a different click mechanism.
+    if(await findExactCartCard(page,b)) return {via:'cart-'+method,diagnostic};
+    const verify=await inspectEventAndChoose(page,b).catch(()=>null);
+    if(verify?.chosen?.active) return {via:'active-'+method,diagnostic};
+  }
+
+  diagnostic.after={count:await fastCartCount(page).catch(()=>null),cart:await snapshotCart(page).catch(()=>null)};
+  const chosen=diagnostic.inspect?.chosen;
+  throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: activation non confirmée. cible=${chosen?.tag||'?'} ${JSON.stringify(chosen?.text||'')} panier=${before}→${diagnostic.after.count}; méthodes=${diagnostic.attempts.map(a=>a.method).join(',')}`,diagnostic);
+}
+'''
+          s=s[:start]+fast+s[end:]
+
+          cb_start=s.find('async function createBulletin(page,inputBets){')
+          cb_end=s.find('\n\n\n\n\nexport const config', cb_start)
+          if cb_start < 0 or cb_end < 0:
+              raise SystemExit('createBulletin block not found')
+
+          cb=r'''async function createBulletin(page,inputBets){
+  const startedAt=Date.now();
+  let stage='résolution des numéros Parions Sport';
+  const elapsed=()=>((Date.now()-startedAt)/1000).toFixed(1);
+  try{
+    let events=[];
+    if((inputBets||[]).some(b=>!Number(b.eventNumber))){
+      events=await fetchParionsL1EventsHttp();
+    }
+    const resolved=(inputBets||[]).map(b=>{
+      if(Number(b.eventNumber)) return {...b,eventNumber:Number(b.eventNumber)};
+      let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
+      if(!e) e=(events||[]).find(x=>sameTeam(b.home,x.away)&&sameTeam(b.away,x.home));
+      if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
+      return {...b,eventNumber:e.eventNumber};
+    });
+    const bets=aggregateBets(resolved);
+
+    stage='ouverture Parions Sport';
+    await page.goto(PS_URL,{waitUntil:'domcontentloaded',timeout:20000});
+    await page.waitForTimeout(700);
+    await dismissPrivacyOverlay(page);
+    await page.waitForTimeout(250);
+
+    stage='passage en mode Simple';
+    await ensureSimpleMode(page);
+    stage='réinitialisation du panier';
+    await resetCart(page);
+
+    for(let i=0;i<bets.length;i++){
+      stage=`sélection ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
+      await ensureUniqueSelection(page,bets[i]);
+    }
+
+    stage='contrôle final des sélections';
+    await page.waitForTimeout(250);
+    for(const b of bets){
+      if(!await selectionConfirmed(page,b))
+        throw new Error(`Contrôle des sélections : N°${b.eventNumber} ${b.outcome} n’est confirmée ni par le panier ni par la cote active.`);
+    }
+
+    stage='application des mises';
+    for(const b of bets) await setStake(page,b);
+    stage='validation et QR';
+    return await validateAndQr(page,bets);
+  }catch(e){
+    if(e && typeof e==='object' && !String(e.message||'').startsWith('[étape ')){
+      e.message=`[étape ${stage} · ${elapsed()} s] ${e.message||String(e)}`;
+    }
+    throw e;
+  }
+}
+'''
+          s=s[:cb_start]+cb+s[cb_end:]
+          p.write_text(s)
+
+          p=Path('index.html')
+          h=p.read_text().replace('V11.4.15','V11.4.16')
+          p.write_text(h)
+
+          p=Path('package.json')
+          q=p.read_text().replace('"version":"11.4.15"','"version":"11.4.16"')
+          p.write_text(q)
+          PY
+      - name: Validate JavaScript
+        run: |
+          node --check api/index.js
+          node -e "const fs=require('fs'); const h=fs.readFileSync('index.html','utf8'); const m=h.match(/<script>([\\s\\S]*?)<\\/script>/); if(!m) throw Error('script missing'); new Function(m[1]); console.log('frontend syntax OK')"
+      - name: Commit V11.4.16
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add api/index.js index.html package.json
+          git commit -m 'Deploy V11.4.16 faster Parions selection loop'
+          git push
