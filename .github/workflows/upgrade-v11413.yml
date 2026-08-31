@@ -1,0 +1,29 @@
+name: Upgrade V11.4.13
+on:
+  push:
+    paths:
+      - .v11413-trigger
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/patch-v11413.py
+      - run: node --check api-index.js
+      - run: |
+          node - <<'NODE'
+          const fs=require('fs');
+          const h=fs.readFileSync('index.html','utf8');
+          const m=h.match(/<script>([\s\S]*?)<\/script>/);
+          if(!m) throw new Error('script missing');
+          new Function(m[1]);
+          console.log('frontend syntax OK');
+          NODE
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add api-index.js index.html package.json
+          git commit -m 'Deploy V11.4.13 decouple bets from mapping'
+          git push
