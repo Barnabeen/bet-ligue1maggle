@@ -507,7 +507,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.23: un seul marqueur de clic peut exister à la fois.
+    // V11.4.24: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -657,7 +657,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.23',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.24',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -748,19 +748,71 @@ async function validateAndQr(page,bets){
     return true;
   });
   if (!clicked) throw new Error('Bouton VALIDER détecté mais clic DOM impossible.');
-  const qrReady = await page.waitForFunction(() => {
-    const btn = document.querySelector('#qr-code-tab-button, button[data="app-cart|qrCodes"]');
-    return !!btn && !btn.disabled;
-  }, {timeout:12000}).then(()=>true).catch(()=>false);
-  if (!qrReady) throw new Error('Bouton QR CODE introuvable après validation.');
-  const qrClicked = await page.evaluate(() => {
-    const btn = document.querySelector('#qr-code-tab-button, button[data="app-cart|qrCodes"]');
-    if (!btn || btn.disabled) return false;
-    btn.click();
+  // V11.4.24 : après VALIDER, le site affiche une action "QR CODE" dans
+  // le panier. Cliquer directement sur l'onglet "Mes QR codes" ne crée pas
+  // l'e-bulletin : il faut d'abord déclencher cette action.
+  const qrActionState = await page.waitForFunction(() => {
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+    const visible=el=>{const r=el.getBoundingClientRect();const cs=getComputedStyle(el);return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';};
+    const candidates=[...document.querySelectorAll('button,a,[role="button"]')]
+      .filter(el=>el.id!=='qr-code-tab-button' && el.getAttribute('data')!=='app-cart|qrCodes' && !el.disabled && visible(el))
+      .map(el=>{
+        const text=norm(el.innerText||el.textContent||'');
+        const aria=norm(el.getAttribute('aria-label')||'');
+        const title=norm(el.getAttribute('title')||'');
+        let score=-1;
+        if(/^QR\s*CODE$/i.test(text)) score=100;
+        else if(/^QR\s*CODE$/i.test(aria)||/^QR\s*CODE$/i.test(title)) score=95;
+        else if(/\bQR\s*CODE\b/i.test(text) && !/Mes\s+QR/i.test(text)) score=60-Math.min(30,text.length/10);
+        return {el,score,text,aria,title};
+      }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score);
+    const best=candidates[0];
+    if(!best) return null;
+    best.el.setAttribute('data-l1maggle-qr-action','1');
+    return {text:best.text,aria:best.aria,title:best.title,tag:best.el.tagName,id:best.el.id||null,score:best.score};
+  }, {timeout:5000}).then(h=>h.jsonValue()).catch(()=>null);
+
+  if(!qrActionState){
+    const buttons=await page.evaluate(()=>{
+      const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+      return [...document.querySelectorAll('button,a,[role="button"]')]
+        .filter(el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0;})
+        .map(el=>({id:el.id||null,text:norm(el.innerText||el.textContent||''),aria:el.getAttribute('aria-label'),disabled:!!el.disabled}))
+        .filter(x=>/QR|VALIDER|OPTION/i.test((x.text||'')+' '+(x.aria||''))).slice(0,30);
+    }).catch(()=>[]);
+    throw new Error('Action QR CODE introuvable après VALIDER. boutons='+JSON.stringify(buttons));
+  }
+
+  const qrActionClicked=await page.evaluate(()=>{
+    const el=document.querySelector('[data-l1maggle-qr-action="1"]');
+    if(!el || el.disabled) return false;
+    el.scrollIntoView({block:'center'});
+    el.click();
     return true;
-  });
-  if (!qrClicked) throw new Error('Bouton QR CODE détecté mais clic DOM impossible.');
-  // V11.4.23: le QR officiel n'est plus supposé être uniquement un <img>
+  }).catch(()=>false);
+  if(!qrActionClicked) throw new Error('Action QR CODE détectée mais clic impossible. action='+JSON.stringify(qrActionState));
+
+  await page.waitForTimeout(650);
+
+  // Une fois l'e-bulletin créé, ouvrir "Mes QR codes" si nécessaire.
+  const qrTabReady = await page.waitForFunction(() => {
+    const btn=document.querySelector('#qr-code-tab-button, button[data="app-cart|qrCodes"]');
+    return !!btn && !btn.disabled;
+  }, {timeout:5000}).then(()=>true).catch(()=>false);
+  if (!qrTabReady) throw new Error('Onglet Mes QR codes introuvable après génération de l’e-bulletin. action='+JSON.stringify(qrActionState));
+
+  const qrTabState = await page.evaluate(() => {
+    const btn=document.querySelector('#qr-code-tab-button, button[data="app-cart|qrCodes"]');
+    if(!btn || btn.disabled) return {ok:false};
+    const cls=String(btn.className||'');
+    const already=/selected|active/i.test(cls)||btn.getAttribute('aria-selected')==='true';
+    if(!already) btn.click();
+    return {ok:true,already,cls,text:String(btn.innerText||btn.textContent||'').trim()};
+  }).catch(()=>({ok:false}));
+  if(!qrTabState.ok) throw new Error('Onglet Mes QR codes détecté mais ouverture impossible.');
+  await page.waitForTimeout(500);
+
+  // V11.4.24: le QR officiel n'est plus supposé être uniquement un <img>
   // PNG base64 de 100–190 px. Parions Sport peut le rendre en canvas, SVG,
   // blob/http ou dans un composant dont il faut capturer visuellement le carré.
   await page.waitForTimeout(450);
@@ -929,7 +981,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.23',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.24',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -942,7 +994,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.23',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.24',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
