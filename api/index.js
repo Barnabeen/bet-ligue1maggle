@@ -309,9 +309,38 @@ async function dismissPrivacyOverlay(page){
 }
 
 async function ensureSimpleMode(page){
-  const btn=page.getByText('Simple',{exact:true}).first();
-  if(await btn.count()) await btn.click().catch(()=>{});
-  await page.waitForTimeout(250);
+  const info=await page.evaluate(()=>{
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+    const visible=el=>{ if(!el) return false; const r=el.getBoundingClientRect(); const cs=getComputedStyle(el); return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden'; };
+    const clicked=[];
+    const cartTabs=[...document.querySelectorAll('button.tabs-cart_btn')].filter(visible);
+    const cartTab=cartTabs.find(b=>b.id!=='qr-code-tab-button' && !/QR\s*CODE/i.test(norm(b.innerText||b.textContent||'')));
+    if(cartTab){ cartTab.click(); clicked.push('cart-tab:'+norm(cartTab.innerText||cartTab.textContent||'')); }
+
+    const roots=[...document.querySelectorAll('app-cart,app-cart-content,.cart-wrapper,.cart-content,.cart-tab-content,.cart-tabs-container')];
+    let simple=null;
+    for(const root of roots){
+      simple=[...root.querySelectorAll('button,[role="button"],a')].find(el=>visible(el)&&/^Simple$/i.test(norm(el.innerText||el.textContent||'')));
+      if(simple) break;
+    }
+    if(!simple){
+      simple=[...document.querySelectorAll('button,[role="button"],a')].find(el=>{
+        if(!visible(el)||!/^Simple$/i.test(norm(el.innerText||el.textContent||''))) return false;
+        let cur=el.parentElement;
+        for(let i=0;cur&&i<5;i++,cur=cur.parentElement){
+          const t=norm(cur.innerText||cur.textContent||'');
+          if(/Combin[ée]|Multiple/i.test(t)) return true;
+        }
+        return false;
+      });
+    }
+    if(simple){ simple.click(); clicked.push('simple:'+norm(simple.innerText||simple.textContent||'')); }
+    const cartRoot=document.querySelector('app-cart,.cart-wrapper,.cart-content');
+    if(cartRoot) cartRoot.scrollIntoView({block:'nearest'});
+    return {clicked,cartTabs:cartTabs.map(b=>({id:b.id||null,text:norm(b.innerText||b.textContent||''),data:b.getAttribute('data')})),simpleFound:!!simple};
+  });
+  await page.waitForTimeout(450);
+  return info;
 }
 
 async function resetCart(page){
@@ -478,7 +507,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.21: un seul marqueur de clic peut exister à la fois.
+    // V11.4.22: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -561,18 +590,36 @@ async function fastCartCount(page){
 async function cartStakeInputIds(page){
   return page.evaluate(()=>{
     const ids=[];
-    const selectors=[
-      'app-bet-simple input[id^="bet-input-"]',
-      'app-cart input[id^="bet-input-"]',
-      'app-cart-content input[id^="bet-input-"]',
-      '.cart-wrapper input[id^="bet-input-"]',
-      '.cart-content input[id^="bet-input-"]',
-      'input[id^="bet-input-"]'
-    ].join(',');
-    for(const input of document.querySelectorAll(selectors)){
-      if(input.id && !ids.includes(input.id)) ids.push(input.id);
+    const seen=new Set();
+    const exact=[...document.querySelectorAll('input[id^="bet-input-"]')];
+    const fallback=[...document.querySelectorAll('app-cart input,app-cart-content input,.cart-wrapper input,.cart-content input')]
+      .filter(input=>{
+        const type=String(input.type||'text').toLowerCase();
+        const ph=String(input.placeholder||'');
+        const name=String(input.name||'');
+        return !['hidden','radio','checkbox','submit','button','search'].includes(type) && (type==='number'||type==='tel'||type==='text'||/mise|stake|montant|€/i.test(ph+' '+name));
+      });
+    for(const input of [...exact,...fallback]){
+      const key=input.id||input.name||`anon-${ids.length}`;
+      if(seen.has(key)) continue;
+      seen.add(key);
+      ids.push(input.id||key);
     }
     return ids;
+  });
+}
+
+async function cartDomDebug(page){
+  return page.evaluate(()=>{
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+    const desc=el=>({tag:el.tagName,id:el.id||null,cls:String(el.className||'').slice(0,140),text:norm(el.innerText||el.textContent||'').slice(0,500),data:el.getAttribute('data')});
+    return {
+      badge:[...document.querySelectorAll('[data="app-cart|nbreParisPanier"],.tabs-cart_number')].map(desc),
+      tabs:[...document.querySelectorAll('button.tabs-cart_btn')].map(desc),
+      simpleButtons:[...document.querySelectorAll('button,[role="button"],a')].filter(x=>/^Simple$/i.test(norm(x.innerText||x.textContent||''))).map(desc).slice(0,10),
+      roots:[...document.querySelectorAll('app-cart,app-cart-content,.cart-wrapper,.cart-content,.cart-tab-content,.cart-tabs-container,app-bet-simple')].map(desc).slice(0,20),
+      inputs:[...document.querySelectorAll('input')].map(x=>({id:x.id||null,name:x.name||null,type:x.type||null,value:x.value||null,placeholder:x.placeholder||null,parent:x.parentElement?.tagName||null})).slice(0,40)
+    };
   });
 }
 
@@ -584,10 +631,10 @@ async function stakeInputForBet(page,b,index=null){
   }
   const idx=Number.isInteger(index)?index:(Number.isInteger(b?._cartIndex)?b._cartIndex:null);
   if(idx!==null){
-    const inputs=page.locator('input[id^="bet-input-"]');
+    const inputs=page.locator('input[id^="bet-input-"], app-cart input[type="number"], app-cart-content input[type="number"], .cart-wrapper input[type="number"], .cart-content input[type="number"]');
     if(await inputs.count()>idx) return inputs.nth(idx);
   }
-  if(b?._stakeInputId){
+  if(b?._stakeInputId && String(b._stakeInputId).startsWith('bet-input-')){
     const id=String(b._stakeInputId).replace(/"/g,'\\"');
     const loc=page.locator(`input[id="${id}"]`).first();
     if(await loc.count()) return loc;
@@ -610,7 +657,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.21',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.22',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -756,12 +803,20 @@ async function createBulletin(page,inputBets){
       if(selected?.stakeInputId) bets[i]._stakeInputId=selected.stakeInputId;
     }
 
+    stage='ouverture panier Simple';
+    const simpleState=await ensureSimpleMode(page);
     stage='binding final des mises';
-    await page.waitForTimeout(350);
-    const stakeIds=await cartStakeInputIds(page);
+    let stakeIds=[];
+    const bindEnd=Date.now()+4500;
+    while(Date.now()<bindEnd){
+      stakeIds=await cartStakeInputIds(page);
+      if(stakeIds.length===bets.length) break;
+      await page.waitForTimeout(120);
+    }
     if(stakeIds.length!==bets.length){
       const snap=await snapshotCart(page).catch(()=>null);
-      throw new Error(`Binding des mises : ${stakeIds.length} champ(s) pour ${bets.length} pari(s). inputs=${JSON.stringify(stakeIds)} panier=${JSON.stringify(snap?.rows?.map(r=>({text:r.text,input:r.input}))||[])}`);
+      const dom=await cartDomDebug(page).catch(()=>null);
+      throw new Error(`Binding des mises : ${stakeIds.length} champ(s) pour ${bets.length} pari(s). simple=${JSON.stringify(simpleState)} inputs=${JSON.stringify(stakeIds)} panier=${JSON.stringify(snap?.rows?.map(r=>({text:r.text,input:r.input}))||[])} dom=${JSON.stringify(dom)}`);
     }
     for(let i=0;i<bets.length;i++){
       bets[i]._cartIndex=i;
@@ -800,7 +855,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.21',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.22',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -813,7 +868,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.21',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.22',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
