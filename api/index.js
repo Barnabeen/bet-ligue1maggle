@@ -8,7 +8,8 @@ async function openRemoteBrowser(){
   const token = process.env.BROWSERLESS_TOKEN;
   if (!direct && !token) throw new Error('BROWSERLESS_NOT_CONFIGURED');
   const base = direct || `wss://production-sfo.browserless.io?token=${encodeURIComponent(token)}&blockAds=true`;
-  const ws = /[?&]timeout=\d+/i.test(base) ? base : `${base}${base.includes('?')?'&':'?'}timeout=120000`;
+  const sessionTimeout=Math.max(60000,Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS)||120000);
+  const ws = /[?&]timeout=\d+/i.test(base) ? base : `${base}${base.includes('?')?'&':'?'}timeout=${sessionTimeout}`;
   return chromium.connectOverCDP(ws,{timeout:20000});
 }
 async function getPage(browser){
@@ -550,7 +551,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.16',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.17',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   diagnostic.before={count:before};
 
@@ -661,7 +662,7 @@ async function createBulletin(page,inputBets){
     const resolved=(inputBets||[]).map(b=>{
       if(Number(b.eventNumber)) return {...b,eventNumber:Number(b.eventNumber)};
       let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
-      if(!e) e=(events||[]).find(x=>sameTeam(b.home.x.away)&&sameTeam(b.away,x.home));
+      if(!e) e=(events||[]).find(x=>sameTeam(b.home,x.away)&&sameTeam(b.away,x.home));
       if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
       return {...b,eventNumber:e.eventNumber};
     });
@@ -679,7 +680,7 @@ async function createBulletin(page,inputBets){
     await resetCart(page);
 
     for(let i=0;i<bets.length;i++){
-      stage=`résolution ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
+      stage=`sélection ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
       await ensureUniqueSelection(page,bets[i]);
     }
 
@@ -715,7 +716,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.16',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.17',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -728,7 +729,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.16',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.17',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
