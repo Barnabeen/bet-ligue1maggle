@@ -168,7 +168,23 @@ async function scrapeParionsL1Events(page){
 }
 function teamKey(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ').replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();}
 function sameTeam(a,b){const x=teamKey(a),y=teamKey(b);return !!x&&!!y&&(x===y||x.includes(y)||y.includes(x));}
-function attachParionsNumbers(data,events){return {...data,matchs:(data.matchs||[]).map(m=>{const e=(events||[]).find(x=>sameTeam(m.domicile,x.home)&&sameTeam(m.exterieur,x.away));return {...m,eventNumber:e?.eventNumber||null};}),parionsEvents:events||[]};}
+function attachParionsNumbers(data,events){
+  const matchs=(data.matchs||[]).map(m=>{
+    let e=(events||[]).find(x=>sameTeam(m.domicile,x.home)&&sameTeam(m.exterieur,x.away));
+    let reversed=false;
+    if(!e){
+      e=(events||[]).find(x=>sameTeam(m.domicile,x.away)&&sameTeam(m.exterieur,x.home));
+      reversed=!!e;
+    }
+    retur {...m,eventNumber:e?.eventNumber||null,parionsMatch:e?{home:e.home,away:e.away,reversed}:null};
+  });
+  return {...data,matchs,parionsEvents:events||[],mappingDiagnostics:{
+    ligue1Matches:matchs.length,
+    parionsEvents:(events||[]).length,
+    mapped:matchs.filter(m=>m.eventNumber).length,
+    unmapped:matches.filter(m=>!m.eventNumber).map(m=>({home:m.domicile,away:m.exterieur}))
+  }};
+}
 
 
 
@@ -464,7 +480,7 @@ async function clickMarkedTarget(page,method){
 
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.10',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.11',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
   diagnostic.inspect=await inspectEventAndChoose(page,b);
   if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
@@ -585,7 +601,20 @@ export const config = { maxDuration: 180 };
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.10',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.11',browserlessConfigured:browserlessConfigured()});
+    if(action==='debug-sync'){
+      if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
+      const browser=await openRemoteBrowser();
+      try{
+        const page=await getPage(browser);
+        const raw=await scrapeLigue1Maggle(page);
+        const events=await scrapeParionsL1Events(page);
+        const data=attachParionsNumbers(raw,events);
+        const pickCounts={};
+        for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
+        return res.status(200).json({ok:true,version:'11.4.11',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length}),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+      }finally{ await browser.close().catch(()=>{}); }
+    }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
     if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
     const browser=await openRemoteBrowser();
