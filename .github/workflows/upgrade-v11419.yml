@@ -1,0 +1,145 @@
+name: Upgrade V11.4.19
+on:
+  push:
+    paths:
+      - '.v11419-trigger'
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V11.4.19
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api/index.js')
+          s=p.read_text()
+
+          marker="""async function waitCartAtLeast(page,minCount,timeoutMs){
+"""
+          helper=r'''async function cartStakeInputIds(page){
+  return page.evaluate(()=>{
+    const ids=[];
+    for(const card of document.querySelectorAll('.cart-item.simple')){
+      const input=card.querySelector('input[id]');
+      if(input?.id && !ids.includes(input.id)) ids.push(input.id);
+    }
+    return ids;
+  });
+}
+
+async function stakeInputForBet(page,b){
+  if(b?._stakeInputId){
+    const id=String(b._stakeInputId).replace(/"/g,'\\"');
+    const loc=page.locator(`input[id="${id}"]`).first();
+    if(await loc.count()) return loc;
+  }
+  const card=await findExactCartCard(page,b);
+  if(card){
+    const input=card.locator('input').first();
+    if(await input.count()) return input;
+  }
+  return null;
+}
+
+'''
+          if marker not in s: raise SystemExit('waitCart marker not found')
+          s=s.replace(marker,helper+marker,1)
+
+          old="""  const before=await fastCartCount(page);
+  diagnostic.before={count:before};
+"""
+          new="""  const before=await fastCartCount(page);
+  const beforeInputIds=await cartStakeInputIds(page);
+  diagnostic.before={count:before,inputIds:beforeInputIds};
+"""
+          if old not in s: raise SystemExit('before block not found')
+          s=s.replace(old,new,1)
+
+          old="""    if(after>=before+1) return {via:'cart-count-'+method,diagnostic};
+"""
+          new="""    if(after>=before+1){
+      const afterInputIds=await cartStakeInputIds(page);
+      const stakeInputId=afterInputIds.find(id=>!beforeInputIds.includes(id))||null;
+      attempt.stakeInputId=stakeInputId;
+      return {via:'cart-count-'+method,diagnostic,stakeInputId};
+    }
+"""
+          if old not in s: raise SystemExit('cart-count success block not found')
+          s=s.replace(old,new,1)
+
+          old=r'''async function setStake(page,b){
+  const card=await findExactCartCard(page,b); if(!card) throw new Error(`Carte N°${b.eventNumber} ${b.outcome} introuvable.`);
+  const input=card.locator('input').first(); if(!await input.count()) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable.`);
+  const val=String(Number(b.stake)); await input.fill(val); await page.waitForTimeout(100);
+  const got=Number(await input.inputValue()); if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée.`);
+}
+'''
+          new=r'''async function setStake(page,b){
+  const input=await stakeInputForBet(page,b);
+  if(!input) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable (inputId=${b._stakeInputId||'aucun'}).`);
+  const val=String(Number(b.stake));
+  await input.fill(val);
+  await page.waitForTimeout(70);
+  const got=Number(await input.inputValue());
+  if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée.`);
+}
+'''
+          if old not in s: raise SystemExit('setStake block not found')
+          s=s.replace(old,new,1)
+
+          old="""  for(const b of bets){ const c=await findExactCartCard(page,b); if(!c) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome}.`); const input=c.locator('input').first(); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
+"""
+          new="""  for(const b of bets){ const input=await stakeInputForBet(page,b); if(!input) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome} (inputId=${b._stakeInputId||'aucun'}).`); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
+"""
+          if old not in s: raise SystemExit('validate stake loop not found')
+          s=s.replace(old,new,1)
+
+          old="""    for(let i=0;i<bets.length;i++){
+      stage=`sélection ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
+      await ensureUniqueSelection(page,bets[i]);
+    }
+
+    stage='contrôle final des sélections';
+"""
+          new="""    for(let i=0;i<bets.length;i++){
+      stage=`sélection ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
+      const selected=await ensureUniqueSelection(page,bets[i]);
+      if(selected?.stakeInputId) bets[i]._stakeInputId=selected.stakeInputId;
+    }
+
+    // V11.4.19: les champs de mise sont des identifiants stables du panier.
+    // Si un clic a été confirmé par l'état actif plutôt que par le compteur,
+    // complète la correspondance par l'ordre DOM uniquement comme filet de sécurité.
+    const stakeIds=await cartStakeInputIds(page);
+    if(stakeIds.length===bets.length){
+      for(let i=0;i<bets.length;i++) if(!bets[i]._stakeInputId) bets[i]._stakeInputId=stakeIds[i];
+    }
+
+    stage='contrôle final des sélections';
+"""
+          if old not in s: raise SystemExit('selection loop not found')
+          s=s.replace(old,new,1)
+
+          s=s.replace('11.4.18','11.4.19')
+          p.write_text(s)
+
+          p=Path('index.html')
+          p.write_text(p.read_text().replace('V11.4.18','V11.4.19'))
+          p=Path('package.json')
+          p.write_text(p.read_text().replace('"version":"11.4.18"','"version":"11.4.19"'))
+          PY
+      - name: Validate JavaScript
+        run: |
+          node --check api/index.js
+          node -e "const fs=require('fs'); const h=fs.readFileSync('index.html','utf8'); const m=h.match(/<script>([\\s\\S]*?)<\\/script>/); if(!m) throw Error('script missing'); new Function(m[1]); console.log('frontend syntax OK')"
+      - name: Commit V11.4.19
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rm -f .github/workflows/upgrade-v11419.yml .v11419-trigger
+          git add -A
+          git commit -m 'Deploy V11.4.19 stable cart stake input mapping'
+          git push
