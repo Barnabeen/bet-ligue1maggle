@@ -18,6 +18,7 @@ jobs:
           s=p.read_text()
           s=s.replace('    retur {...m,eventNumber:e?.eventNumber||null,parionsMatch:e?{home:e.home,away:e.away,reversed}:null};','    return {...m,eventNumber:e?.eventNumber||null,parionsMatch:e?{home:e.home,away:e.away,reversed}:null};')
           s=s.replace('    unmapped:matches.filter(m=>!m.eventNumber).map(m=>({home:m.domicile,away:m.exterieur}))','    unmapped:matchs.filter(m=>!m.eventNumber).map(m=>({home:m.domicile,away:m.exterieur}))')
+          s=s.replace("validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length}),parionsEvents:","validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:")
           s=s.replace("version:'11.4.11'","version:'11.4.12'").replace("version:'11.4.10'","version:'11.4.12'")
           p.write_text(s)
           p=Path('index.html'); h=p.read_text().replace('V11.4.11','V11.4.12').replace('V11.4.10','V11.4.12'); p.write_text(h)
