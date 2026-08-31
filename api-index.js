@@ -116,6 +116,27 @@ async function scrapeLigue1Maggle(page){
   });
 }
 
+const PS_L1_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-uber-eats/45452';
+async function scrapeParionsL1Events(page){
+  await page.goto(PS_L1_URL,{waitUntil:'domcontentloaded'}); await page.waitForTimeout(1400); await dismissPrivacyOverlay(page).catch(()=>{});
+  return page.evaluate(()=>{
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim(),out=[],seen=new Set();
+    for(const el of document.querySelectorAll('article,li,tr,[class*="event"],[class*="match"],div')){
+      const t=norm(el.innerText||el.textContent||'');
+      if(!/N[°ºo]?\s*\d+/i.test(t)||!/1\s*\/\s*N\s*\/\s*2/i.test(t)) continue;
+      if([...el.children].some(c=>{const x=norm(c.innerText||c.textContent||'');return /N[°ºo]?\s*\d+/i.test(x)&&/1\s*\/\s*N\s*\/\s*2/i.test(x)})) continue;
+      const n=t.match(/N[°ºo]?\s*(\d+)/i); if(!n) continue;
+      const before=t.slice(0,n.index).replace(/\s+L1\s+McDonald'?s.*$/i,'').trim();
+      const m=before.match(/([A-Za-zÀ-ÿ0-9 .'-]+?)\s*[-–]\s*([A-Za-zÀ-ÿ0-9 .'-]+)$/);
+      if(!m||seen.has(n[1])) continue; seen.add(n[1]);
+      out.push({home:norm(m[1]),away:norm(m[2]),eventNumber:+n[1]});
+    } return out;
+  });
+}
+function teamKey(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ').replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();}
+function sameTeam(a,b){const x=teamKey(a),y=teamKey(b);return !!x&&!!y&&(x===y||x.includes(y)||y.includes(x));}
+function attachParionsNumbers(data,events){return {...data,matchs:(data.matchs||[]).map(m=>{const e=(events||[]).find(x=>sameTeam(m.domicile,x.home)&&sameTeam(m.exterieur,x.away));return {...m,eventNumber:e?.eventNumber||null};}),parionsEvents:events||[]};}
+
 
 
 
@@ -410,7 +431,7 @@ async function clickMarkedTarget(page,method){
 
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.8',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.9',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
   diagnostic.inspect=await inspectEventAndChoose(page,b);
   if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
@@ -531,13 +552,13 @@ export const config = { maxDuration: 180 };
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.8',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.9',browserlessConfigured:browserlessConfigured()});
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
     if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
     const browser=await openRemoteBrowser();
     try{
       const page=await getPage(browser);
-      if(action==='sync') return res.status(200).json({ok:true,data:await scrapeLigue1Maggle(page)});
+      if(action==='sync'){ const data=await scrapeLigue1Maggle(page); const events=await scrapeParionsL1Events(page); return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)}); }
       if(action==='create-bulletin'){
         const bets=req.body?.bets; if(!Array.isArray(bets)||!bets.length) return res.status(400).json({ok:false,error:'Aucun pari reçu'});
         return res.status(200).json({ok:true,...await createBulletin(page,bets)});
