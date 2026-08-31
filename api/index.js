@@ -517,30 +517,71 @@ async function clickMarkedTarget(page,method){
   }catch(e){ return {ok:false,method,box,error:String(e?.message||e)}; }
 }
 
+async function fastCartCount(page){
+  return page.evaluate(()=>{
+    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
+    const badge=[...document.querySelectorAll('[data="app-cart|nbreParisPanier"], .tabs-cart_number')]
+      .map(x=>parseInt(norm(x.innerText||x.textContent||'').replace(/\D/g,''),10))
+      .find(Number.isFinite);
+    if(Number.isFinite(badge)) return badge;
+    const cards=[...document.querySelectorAll('.cart-item.simple')];
+    const signatures=new Set(cards.map(card=>{
+      const input=card.querySelector('input');
+      const id=input?.id||input?.getAttribute('name')||'';
+      const text=norm(card.innerText||card.textContent||'');
+      return id?`id:${id}`:`txt:${text}`;
+    }));
+    return signatures.size;
+  });
+}
+
+async function waitCartAtLeast(page,minCount,timeoutMs){
+  const end=Date.now()+timeoutMs;
+  let last=0;
+  while(Date.now()<end){
+    if(page.isClosed()) throw new Error('BROWSERLESS_PAGE_CLOSED_DURING_CART_WAIT');
+    last=await fastCartCount(page);
+    if(last>=minCount) return last;
+    await page.waitForTimeout(90);
+  }
+  return await fastCartCount(page);
+}
+
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.15',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
-  diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
-  diagnostic.inspect=await inspectEventAndChoose(page,b);
-  if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
-  if(diagnostic.inspect?.chosen?.active) return {via:'active-existing',diagnostic};
 
-  for(const method of ['locator','pointer','dom-events']){
-    // Relocaliser avant chaque tentative. Si une tentative précédente a finalement activé la cote, ne surtout pas recliquer.
-    const pre=await targetState(page,b);
-    if(pre.exact||pre.active) return {via:pre.exact?'cart':'active',diagnostic};
-    if(!pre.fresh?.ok) break;
+  const diagnostic={version:'11.4.16',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const before=await fastCartCount(page);
+  diagnostic.before={count:before};
+
+  let inspect=await inspectEventAndChoose(page,b);
+  diagnostic.inspect=inspect;
+  if(!inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
+  if(inspect?.chosen?.active) return {via:'active-existing',diagnostic};
+
+  for(const [method,waitMs] of [['locator',1200],['pointer',850],['dom-events',850]]){
+    inspect=await inspectEventAndChoose(page,b);
+    if(!inspect?.ok) break;
+    if(inspect?.chosen?.active) return {via:'active-before-'+method,diagnostic};
+    if(await findExactCartCard(page,b)) return {via:'cart-before-'+method,diagnostic};
+
     const click=await clickMarkedTarget(page,method);
-    const attempt={method,click,states:[]}; diagnostic.attempts.push(attempt);
-    for(const ms of [100,250,500,900,1500]){
-      await page.waitForTimeout(ms===100?100:ms-attempt.states.at(-1)?.ms||100);
-      const s=await targetState(page,b);
-      attempt.states.push({ms,exact:s.exact,active:s.active,count:s.count,badge:s.badge,target:s.fresh?.chosen||null});
-      if(s.exact||s.active) return {via:s.exact?'cart':`active-${method}`,diagnostic};
-    }
+    const attempt={method,click};
+    diagnostic.attempts.push(attempt);
+    if(!click?.ok) continue;
+
+    const after=await waitCartAtLeast(page,before+1,waitMs);
+    attempt.afterCount=after;
+    if(after>=before+1) return {via:'cart-count-'+method,diagnostic};
+
+    if(await findExactCartCard(page,b)) return {via:'cart-'+method,diagnostic};
+    const verify=await inspectEventAndChoose(page,b).catch(()=>null);
+    if(verify?.chosen?.active) return {via:'active-'+method,diagnostic};
   }
-  const lastAttempt=diagnostic.attempts.at(-1), last=lastAttempt?.states?.at(-1), chosen=diagnostic.inspect?.chosen;
-  throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: activation non confirmée après clic réaliste. cible=${chosen?.tag||'?'} ${JSON.stringify(chosen?.text||'')} activeAvant=${!!chosen?.active}; panier=${diagnostic.before.count}→${last?.count}; badge=${diagnostic.before.badge}→${last?.badge}; méthodes=${diagnostic.attempts.map(a=>a.method).join(',')}`,diagnostic);
+
+  diagnostic.after={count:await fastCartCount(page).catch(()=>null),cart:await snapshotCart(page).catch(()=>null)};
+  const chosen=diagnostic.inspect?.chosen;
+  throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: activation non confirmée. cible=${chosen?.tag||'?'} ${JSON.stringify(chosen?.text||'')} panier=${before}→${diagnostic.after.count}; méthodes=${diagnostic.attempts.map(a=>a.method).join(',')}`,diagnostic);
 }
 
 async function selectionConfirmed(page,b){
@@ -609,39 +650,58 @@ async function validateAndQr(page,bets){
   throw new Error('QR Code officiel introuvable après validation.');
 }
 async function createBulletin(page,inputBets){
-  let events=[];
-  if((inputBets||[]).some(b=>!Number(b.eventNumber))){
-    events=await fetchParionsL1EventsHttp();
+  const startedAt=Date.now();
+  let stage='résolution des numéros Parions Sport';
+  const elapsed=()=>((Date.now()-startedAt)/1000).toFixed(1);
+  try{
+    let events=[];
+    if((inputBets||[]).some(b=>!Number(b.eventNumber))){
+      events=await fetchParionsL1EventsHttp();
+    }
+    const resolved=(inputBets||[]).map(b=>{
+      if(Number(b.eventNumber)) return {...b,eventNumber:Number(b.eventNumber)};
+      let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
+      if(!e) e=(events||[]).find(x=>sameTeam(b.home.x.away)&&sameTeam(b.away,x.home));
+      if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
+      return {...b,eventNumber:e.eventNumber};
+    });
+    const bets=aggregateBets(resolved);
+
+    stage='ouverture Parions Sport';
+    await page.goto(PS_URL, {waitUntil:'domcontentloaded',timeout:20000});
+    await page.waitForTimeout(700);
+    await dismissPrivacyOverlay(page);
+    await page.waitForTimeout(250);
+
+    stage='passage en mode Simple';
+    await ensureSimpleMode(page);
+    stage='réinitialisation du panier';
+    await resetCart(page);
+
+    for(let i=0;i<bets.length;i++){
+      stage=`résolution ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
+      await ensureUniqueSelection(page,bets[i]);
+    }
+
+    stage='contrôle final des sélections';
+    await page.waitForTimeout(250);
+    for(const b of bets){
+      if(!await selectionConfirmed(page,b))
+        throw new Error(`Contrôle des sélections : N°${b.eventNumber} ${b.outcome} n’est confirmée ni par le panier ni par la cote active.`);
+    }
+
+    stage='application des mises';
+    for(const b of bets) await setStake(page,b);
+    stage='validation et QR';
+    return await validateAndQr(page,bets);
+  }catch(e){
+    if(e && typeof e==='object' && !String(e.message||'').startsWith('[étape ')){
+      e.message=`[étape ${stage} · ${elapsed()} s] ${e.message||String(e)}`;
+    }
+    throw e;
   }
-  const resolved=(inputBets||[]).map(b=>{
-    if(Number(b.eventNumber)) return {...b,eventNumber:Number(b.eventNumber)};
-    let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
-    if(!e) e=(events||[]).find(x=>sameTeam(b.home,x.away)&&sameTeam(b.away,x.home));
-    if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
-    return {...b,eventNumber:e.eventNumber};
-  });
-  const bets=aggregateBets(resolved);
-  await page.goto(PS_URL,{waitUntil:'domcontentloaded'});
-  await page.waitForTimeout(1200);
-  await dismissPrivacyOverlay(page);
-  await page.waitForTimeout(600);
-  await ensureSimpleMode(page);
-  await resetCart(page);
-
-  // Pass 1: one click maximum per canonical event/outcome. No stake input yet.
-  for(const b of bets) await ensureUniqueSelection(page,b);
-
-  // Laisser finir les rerenders puis vérifier chaque carte exacte dans le panier.
-  await page.waitForTimeout(500);
-  for(const b of bets){
-    if(!await selectionConfirmed(page,b))
-      throw new Error(`Contrôle des sélections : N°${b.eventNumber} ${b.outcome} n’est confirmée ni par le panier ni par la cote active.`);
-  }
-
-  // Pass 2: stakes only after the complete selection pass.
-  for(const b of bets) await setStake(page,b);
-  return validateAndQr(page,bets);
 }
+
 
 
 
@@ -655,7 +715,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.15',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.16',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -668,7 +728,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.15',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.16',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
