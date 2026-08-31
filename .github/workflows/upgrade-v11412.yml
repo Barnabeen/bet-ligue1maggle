@@ -1,0 +1,34 @@
+name: Upgrade V11.4.12
+on:
+  push:
+    paths:
+      - '.v11412-trigger'
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hotfix V11.4.12
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api-index.js')
+          s=p.read_text()
+          s=s.replace('    retur {...m,eventNumber:e?.eventNumber||null,parionsMatch:e?{home:e.home,away:e.away,reversed}:null};','    return {...m,eventNumber:e?.eventNumber||null,parionsMatch:e?{home:e.home,away:e.away,reversed}:null};')
+          s=s.replace('    unmapped:matches.filter(m=>!m.eventNumber).map(m=>({home:m.domicile,away:m.exterieur}))','    unmapped:matchs.filter(m=>!m.eventNumber).map(m=>({home:m.domicile,away:m.exterieur}))')
+          s=s.replace("version:'11.4.11'","version:'11.4.12'").replace("version:'11.4.10'","version:'11.4.12'")
+          p.write_text(s)
+          p=Path('index.html'); h=p.read_text().replace('V11.4.11','V11.4.12').replace('V11.4.10','V11.4.12'); p.write_text(h)
+          p=Path('package.json'); q=p.read_text().replace('"version":"11.4.11"','"version":"11.4.12"').replace('"version":"11.4.10"','"version":"11.4.12"'); p.write_text(q)
+          PY
+      - name: Syntax check
+        run: node --check api-index.js
+      - name: Commit V11.4.12
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add api-index.js index.html package.json
+          git commit -m 'Deploy V11.4.12 fix server crash'
+          git push
