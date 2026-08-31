@@ -1,0 +1,56 @@
+name: Upgrade V11.4.21
+on:
+  push:
+    paths:
+      - '.github/workflows/upgrade-v11421.yml'
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V11.4.21
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('api/index.js')
+          s=p.read_text()
+
+          a=s.index('async function uniqueSimpleCardCount(page){')
+          z=s.index('\nasync function cartCount(page){',a)
+          replacement='''async function uniqueSimpleCardCount(page){\n  const ids=await cartStakeInputIds(page).catch(()=>[]);\n  if(ids.length) return ids.length;\n  return page.locator('.cart-item.simple, app-bet-simple').evaluateAll(cards => {\n    const norm=s=>String(s||'').replace(/\\s+/g,' ').trim();\n    const signatures=new Set();\n    for(const card of cards){\n      const input=card.querySelector('input');\n      const id=input?.id || input?.getAttribute('name') || '';\n      const text=norm(card.innerText || card.textContent || '');\n      const value=input?.value || '';\n      signatures.add(id ? `id:${id}` : `txt:${text}|stake:${value}`);\n    }\n    return signatures.size;\n  });\n}\n'''
+          s=s[:a]+replacement+s[z:]
+
+          a=s.index('async function cartStakeInputIds(page){')
+          z=s.index('\nasync function stakeInputForBet(page,b,index=null){',a)
+          replacement='''async function cartStakeInputIds(page){\n  return page.evaluate(()=>{\n    const ids=[];\n    const selectors=[\n      'app-bet-simple input[id^="bet-input-"]',\n      'app-cart input[id^="bet-input-"]',\n      'app-cart-content input[id^="bet-input-"]',\n      '.cart-wrapper input[id^="bet-input-"]',\n      '.cart-content input[id^="bet-input-"]',\n      'input[id^="bet-input-"]'\n    ].join(',');\n    for(const input of document.querySelectorAll(selectors)){\n      if(input.id && !ids.includes(input.id)) ids.push(input.id);\n    }\n    return ids;\n  });\n}\n'''
+          s=s[:a]+replacement+s[z:]
+
+          a=s.index('async function stakeInputForBet(page,b,index=null){')
+          z=s.index('\nasync function waitCartAtLeast(page,minCount,timeoutMs){',a)
+          replacement='''async function stakeInputForBet(page,b,index=null){\n  const card=await findExactCartCard(page,b);\n  if(card){\n    const input=card.locator('input[id^="bet-input-"], input').first();\n    if(await input.count()) return input;\n  }\n  const idx=Number.isInteger(index)?index:(Number.isInteger(b?._cartIndex)?b._cartIndex:null);\n  if(idx!==null){\n    const inputs=page.locator('input[id^="bet-input-"]');\n    if(await inputs.count()>idx) return inputs.nth(idx);\n  }\n  if(b?._stakeInputId){\n    const id=String(b._stakeInputId).replace(/"/g,'\\\\"');\n    const loc=page.locator(`input[id="${id}"]`).first();\n    if(await loc.count()) return loc;\n  }\n  return null;\n}\n'''
+          s=s[:a]+replacement+s[z:]
+
+          old="""    await page.waitForTimeout(250);\n    const stakeIds=await cartStakeInputIds(page);\n    if(stakeIds.length!==bets.length) throw new Error(`Binding des mises : ${stakeIds.length} champ(s) pour ${bets.length} pari(s).`);\n"""
+          new="""    stage='binding final des mises';\n    await page.waitForTimeout(350);\n    const stakeIds=await cartStakeInputIds(page);\n    if(stakeIds.length!==bets.length){\n      const snap=await snapshotCart(page).catch(()=>null);\n      throw new Error(`Binding des mises : ${stakeIds.length} champ(s) pour ${bets.length} pari(s). inputs=${JSON.stringify(stakeIds)} panier=${JSON.stringify(snap?.rows?.map(r=>({text:r.text,input:r.input}))||[])}`);\n    }\n"""
+          if old not in s: raise SystemExit('binding block not found')
+          s=s.replace(old,new,1)
+
+          s=s.replace('11.4.20','11.4.21')
+          p.write_text(s)
+          p=Path('index.html'); p.write_text(p.read_text().replace('V11.4.20','V11.4.21'))
+          p=Path('package.json'); p.write_text(p.read_text().replace('"version":"11.4.20"','"version":"11.4.21"'))
+          PY
+      - name: Validate JavaScript
+        run: |
+          node --check api/index.js
+          node -e "const fs=require('fs'); const h=fs.readFileSync('index.html','utf8'); const m=h.match(/<script>([\\s\\S]*?)<\\/script>/); if(!m) throw Error('script missing'); new Function(m[1]); console.log('frontend syntax OK')"
+      - name: Commit V11.4.21
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rm -f .github/workflows/upgrade-v11421.yml .github/workflows/upgrade-v11420.yml .v11420-trigger .v11420_patch.py
+          git add -A
+          git commit -m 'Deploy V11.4.21 robust Parions stake input discovery'
+          git push
