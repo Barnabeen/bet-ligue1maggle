@@ -470,7 +470,19 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    if(chosen) chosen.setAttribute('data-l1-debug-target','1');
+    // V11.4.18: un seul marqueur de clic peut exister à la fois.
+    // Les anciennes versions laissaient les marqueurs des matchs précédents,
+    // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
+    document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
+      el.removeAttribute('data-l1-debug-target');
+      el.removeAttribute('data-l1-debug-event');
+      el.removeAttribute('data-l1-debug-outcome');
+    });
+    if(chosen){
+      chosen.setAttribute('data-l1-debug-target','1');
+      chosen.setAttribute('data-l1-debug-event',String(eventNumber));
+      chosen.setAttribute('data-l1-debug-outcome',String(outcome));
+    }
 
     return {
       ok:!!chosen,
@@ -491,8 +503,10 @@ async function targetState(page,b){
 }
 
 async function clickMarkedTarget(page,method){
-  const loc=page.locator('[data-l1-debug-target="1"]').first();
-  if(!await loc.count()) return {ok:false,method,reason:'target-missing'};
+  const marked=page.locator('[data-l1-debug-target="1"]');
+  const markedCount=await marked.count();
+  if(markedCount!==1) return {ok:false,method,reason:`target-count-${markedCount}`};
+  const loc=marked.first();
   await loc.scrollIntoViewIfNeeded().catch(()=>{});
   const box=await loc.boundingBox().catch(()=>null);
   try{
@@ -551,7 +565,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.17',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.18',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   diagnostic.before={count:before};
 
@@ -716,7 +730,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.17',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.18',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -729,7 +743,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.17',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.18',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
