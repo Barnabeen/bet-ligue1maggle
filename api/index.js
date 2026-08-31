@@ -470,7 +470,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.18: un seul marqueur de clic peut exister à la fois.
+    // V11.4.19: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -550,6 +550,31 @@ async function fastCartCount(page){
   });
 }
 
+async function cartStakeInputIds(page){
+  return page.evaluate(()=>{
+    const ids=[];
+    for(const card of document.querySelectorAll('.cart-item.simple')){
+      const input=card.querySelector('input[id]');
+      if(input?.id && !ids.includes(input.id)) ids.push(input.id);
+    }
+    return ids;
+  });
+}
+
+async function stakeInputForBet(page,b){
+  if(b?._stakeInputId){
+    const id=String(b._stakeInputId).replace(/"/g,'\\"');
+    const loc=page.locator(`input[id="${id}"]`).first();
+    if(await loc.count()) return loc;
+  }
+  const card=await findExactCartCard(page,b);
+  if(card){
+    const input=card.locator('input').first();
+    if(await input.count()) return input;
+  }
+  return null;
+}
+
 async function waitCartAtLeast(page,minCount,timeoutMs){
   const end=Date.now()+timeoutMs;
   let last=0;
@@ -565,9 +590,10 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.18',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.19',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
-  diagnostic.before={count:before};
+  const beforeInputIds=await cartStakeInputIds(page);
+  diagnostic.before={count:before,inputIds:beforeInputIds};
 
   let inspect=await inspectEventAndChoose(page,b);
   diagnostic.inspect=inspect;
@@ -587,7 +613,12 @@ async function ensureUniqueSelection(page,b){
 
     const after=await waitCartAtLeast(page,before+1,waitMs);
     attempt.afterCount=after;
-    if(after>=before+1) return {via:'cart-count-'+method,diagnostic};
+    if(after>=before+1){
+      const afterInputIds=await cartStakeInputIds(page);
+      const stakeInputId=afterInputIds.find(id=>!beforeInputIds.includes(id))||null;
+      attempt.stakeInputId=stakeInputId;
+      return {via:'cart-count-'+method,diagnostic,stakeInputId};
+    }
 
     if(await findExactCartCard(page,b)) return {via:'cart-'+method,diagnostic};
     const verify=await inspectEventAndChoose(page,b).catch(()=>null);
@@ -611,16 +642,19 @@ async function selectionConfirmed(page,b){
 const PS_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-mcdonald-s/45452';
 
 async function setStake(page,b){
-  const card=await findExactCartCard(page,b); if(!card) throw new Error(`Carte N°${b.eventNumber} ${b.outcome} introuvable.`);
-  const input=card.locator('input').first(); if(!await input.count()) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable.`);
-  const val=String(Number(b.stake)); await input.fill(val); await page.waitForTimeout(100);
-  const got=Number(await input.inputValue()); if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée.`);
+  const input=await stakeInputForBet(page,b);
+  if(!input) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable (inputId=${b._stakeInputId||'aucun'}).`);
+  const val=String(Number(b.stake));
+  await input.fill(val);
+  await page.waitForTimeout(70);
+  const got=Number(await input.inputValue());
+  if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée.`);
 }
 async function validateAndQr(page,bets){
   const uniqueCount=await uniqueSimpleCardCount(page);
   if(uniqueCount!==bets.length) throw new Error(`Contrôle panier : ${uniqueCount} carte(s) Simple unique(s) pour ${bets.length} sélection(s) attendue(s).`);
   let total=0;
-  for(const b of bets){ const c=await findExactCartCard(page,b); if(!c) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome}.`); const input=c.locator('input').first(); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
+  for(const b of bets){ const input=await stakeInputForBet(page,b); if(!input) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome} (inputId=${b._stakeInputId||'aucun'}).`); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
   const validateInfo = await page.evaluate(() => {
     const norm = s => String(s || '').replace(/\s+/g,' ').trim();
     const candidates = [...document.querySelectorAll('app-cart-content button, .cart-wrapper button, .cart-content button, button.button')];
@@ -695,7 +729,13 @@ async function createBulletin(page,inputBets){
 
     for(let i=0;i<bets.length;i++){
       stage=`sélection ${i+1}/${bets.length} · N°${bets[i].eventNumber} ${bets[i].outcome}`;
-      await ensureUniqueSelection(page,bets[i]);
+      const selected=await ensureUniqueSelection(page,bets[i]);
+      if(selected?.stakeInputId) bets[i]._stakeInputId=selected.stakeInputId;
+    }
+
+    const stakeIds=await cartStakeInputIds(page);
+    if(stakeIds.length===bets.length){
+      for(let i=0;i<bets.length;i++) if(!bets[i]._stakeInputId) bets[i]._stakeInputId=stakeIds[i];
     }
 
     stage='contrôle final des sélections';
@@ -730,7 +770,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.18',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.19',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -743,7 +783,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.18',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.19',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
