@@ -1,6 +1,9 @@
 name: Upgrade V11.4.9
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.v1149-trigger'
 permissions:
   contents: write
 jobs:
@@ -12,67 +15,30 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          p=Path('api-index.js')
-          s=p.read_text()
+          p=Path('api-index.js'); s=p.read_text()
           marker="\n\n\n\nfunction aggregateBets(bets){"
           helper=r'''
 
 const PS_L1_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-uber-eats/45452';
-
 async function scrapeParionsL1Events(page){
-  await page.goto(PS_L1_URL,{waitUntil:'domcontentloaded'});
-  await page.waitForTimeout(1400);
-  await dismissPrivacyOverlay(page).catch(()=>{});
-  return page.evaluate(()=>{
-    const norm=s=>String(s||'').replace(/\s+/g,' ').trim();
-    const out=[];
-    const seen=new Set();
-    for(const el of document.querySelectorAll('article,li,tr,[class*="event"],[class*="match"],div')){
-      const t=norm(el.innerText||el.textContent||'');
-      if(!/N[°ºo]?\s*\d+/i.test(t)||!/1\s*\/\s*N\s*\/\s*2/i.test(t)) continue;
-      if([...el.children].some(c=>{const x=norm(c.innerText||c.textContent||'');return /N[°ºo]?\s*\d+/i.test(x)&&/1\s*\/\s*N\s*\/\s*2/i.test(x)})) continue;
-      const n=t.match(/N[°ºo]?\s*(\d+)/i);
-      const before=t.slice(0,n?.index??0).replace(/\s+L1\s+McDonald'?s.*$/i,'').trim();
-      const m=before.match(/([A-Za-zÀ-ÿ0-9 .'-]+?)\s*[-–]\s*([A-Za-zÀ-ÿ0-9 .'-]+)$/);
-      if(!n||!m) continue;
-      const key=n[1]; if(seen.has(key)) continue; seen.add(key);
-      out.push({home:norm(m[1]),away:norm(m[2]),eventNumber:+n[1]});
-    }
-    return out;
-  });
+  await page.goto(PS_L1_URL,{waitUntil:'domcontentloaded'}); await page.waitForTimeout(1400); await dismissPrivacyOverlay(page).catch(()=>{});
+  return page.evaluate(()=>{const norm=s=>String(s||'').replace(/\s+/g,' ').trim(),out=[],seen=new Set(); for(const el of document.querySelectorAll('article,li,tr,[class*="event"],[class*="match"],div')){const t=norm(el.innerText||el.textContent||''); if(!/N[°ºo]?\s*\d+/i.test(t)||!/1\s*\/\s*N\s*\/\s*2/i.test(t))continue; if([...el.children].some(c=>{const x=norm(c.innerText||c.textContent||'');return /N[°ºo]?\s*\d+/i.test(x)&&/1\s*\/\s*N\s*\/\s*2/i.test(x)}))continue; const n=t.match(/N[°ºo]?\s*(\d+)/i); const before=t.slice(0,n?.index??0).replace(/\s+L1\s+McDonald'?s.*$/i,'').trim(); const m=before.match(/([A-Za-zÀ-ÿ0-9 .'-]+?)\s*[-–]\s*([A-Za-zÀ-ÿ0-9 .'-]+)$/); if(!n||!m||seen.has(n[1]))continue; seen.add(n[1]); out.push({home:norm(m[1]),away:norm(m[2]),eventNumber:+n[1]});} return out;});
 }
-
-function teamKey(s){
-  return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
-    .replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ').replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();
-}
-function sameTeam(a,b){
-  const x=teamKey(a),y=teamKey(b); if(!x||!y) return false;
-  return x===y||x.includes(y)||y.includes(x);
-}
-function attachParionsNumbers(data,events){
-  return {...data,matchs:(data.matchs||[]).map(m=>{
-    const e=(events||[]).find(x=>sameTeam(m.domicile,x.home)&&sameTeam(m.exterieur,x.away));
-    return {...m,eventNumber:e?.eventNumber||null};
-  }),parionsEvents:events||[]};
-}
+function teamKey(s){return String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ').replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();}
+function sameTeam(a,b){const x=teamKey(a),y=teamKey(b);return !!x&&!!y&&(x===y||x.includes(y)||y.includes(x));}
+function attachParionsNumbers(data,events){return {...data,matchs:(data.matchs||[]).map(m=>{const e=(events||[]).find(x=>sameTeam(m.domicile,x.home)&&sameTeam(m.exterieur,x.away));return {...m,eventNumber:e?.eventNumber||null};}),parionsEvents:events||[]};}
 '''
-          if 'scrapeParionsL1Events' not in s:
-            s=s.replace(marker,helper+marker)
+          if 'scrapeParionsL1Events' not in s: s=s.replace(marker,helper+marker)
           s=s.replace("version:'11.4.8'","version:'11.4.9'")
           old="if(action==='sync') return res.status(200).json({ok:true,data:await scrapeLigue1Maggle(page)});"
           new="if(action==='sync'){ const data=await scrapeLigue1Maggle(page); const events=await scrapeParionsL1Events(page); return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)}); }"
           if old not in s: raise SystemExit('sync handler marker missing')
-          s=s.replace(old,new)
-          p.write_text(s)
-
-          p=Path('index.html'); h=p.read_text()
-          h=h.replace('V11.4.8','V11.4.9')
+          p.write_text(s.replace(old,new))
+          p=Path('index.html'); h=p.read_text().replace('V11.4.8','V11.4.9')
           h=h.replace("const MAP={'Lille|Paris SG':5,'Strasbourg|Lens':326,'Lyon|Le Havre':330,'Auxerre|Angers':327,'Brest|Toulouse':328,'Lorient|Troyes':329,'Paris FC|Nice':571,'Rennes|Le Mans':594,'Monaco|Marseille':601};let D,sel=new Set,stakes={};","let D,sel=new Set,stakes={};")
           h=h.replace("const o=m.pronostics?.[n],num=MAP[m.domicile+'|'+m.exterieur];","const o=m.pronostics?.[n],num=m.eventNumber;")
           p.write_text(h)
-
-          p=Path('package.json'); q=p.read_text().replace('"version":"11.4.8"','"version":"11.4.9"'); p.write_text(q)
+          p=Path('package.json'); p.write_text(p.read_text().replace('"version":"11.4.8"','"version":"11.4.9"'))
       - name: Commit V11.4.9
         run: |
           git config user.name github-actions[bot]
