@@ -17,7 +17,8 @@ replacement=r'''async function findExactCartCard(page,b){
     const teamsMatch=!!homeKey&&!!awayKey&&textKey.includes(homeKey)&&textKey.includes(awayKey);
     if(!eventMatch && !teamsMatch) continue;
     if(label==='n'){
-      if(/(?:^|\\s)N(?:\\s|$)/i.test(text.split(/1\\s*\\/\\s*N\\s*\\/\\s*2/i).pop()||'') || /(?:^|\\s)N(?:\\s|$)/i.test(text)) return c;
+      const cleaned=text.replace(new RegExp('1\\s*/\\s*N\\s*/\\s*2','ig'),' ');
+      if(new RegExp('(?:^|\\s)N(?:\\s|$)','i').test(cleaned)) return c;
     }else if(low.includes(label)) return c;
   }
   return null;
