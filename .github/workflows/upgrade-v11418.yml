@@ -1,0 +1,77 @@
+name: Upgrade V11.4.18
+on:
+  push:
+    paths:
+      - '.v11418-trigger'
+permissions:
+  contents: write
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch V11.4.18
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p=Path('api/index.js')
+          s=p.read_text()
+
+          old="""    const chosen=scored[0]?.el||null;
+    if(chosen) chosen.setAttribute('data-l1-debug-target','1');
+"""
+          new="""    const chosen=scored[0]?.el||null;
+    // V11.4.18: un seul marqueur de clic peut exister à la fois.
+    // Les anciennes versions laissaient les marqueurs des matchs précédents,
+    // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
+    document.querySelectorAll('[data-l1-debug-target=\"1\"]').forEach(el=>{
+      el.removeAttribute('data-l1-debug-target');
+      el.removeAttribute('data-l1-debug-event');
+      el.removeAttribute('data-l1-debug-outcome');
+    });
+    if(chosen){
+      chosen.setAttribute('data-l1-debug-target','1');
+      chosen.setAttribute('data-l1-debug-event',String(eventNumber));
+      chosen.setAttribute('data-l1-debug-outcome',String(outcome));
+    }
+"""
+          if old not in s:
+              raise SystemExit('marker block not found')
+          s=s.replace(old,new,1)
+
+          old2="""async function clickMarkedTarget(page,method){
+  const loc=page.locator('[data-l1-debug-target=\"1\"]').first();
+  if(!await loc.count()) return {ok:false,method,reason:'target-missing'};
+"""
+          new2="""async function clickMarkedTarget(page,method){
+  const marked=page.locator('[data-l1-debug-target=\"1\"]');
+  const markedCount=await marked.count();
+  if(markedCount!==1) return {ok:false,method,reason:`target-count-${markedCount}`};
+  const loc=marked.first();
+"""
+          if old2 not in s:
+              raise SystemExit('clickMarkedTarget block not found')
+          s=s.replace(old2,new2,1)
+
+          s=s.replace('11.4.17','11.4.18')
+          p.write_text(s)
+
+          p=Path('index.html')
+          p.write_text(p.read_text().replace('V11.4.17','V11.4.18'))
+
+          p=Path('package.json')
+          p.write_text(p.read_text().replace('"version":"11.4.17"','"version":"11.4.18"'))
+          PY
+      - name: Validate JavaScript
+        run: |
+          node --check api/index.js
+          node -e "const fs=require('fs'); const h=fs.readFileSync('index.html','utf8'); const m=h.match(/<script>([\\s\\S]*?)<\\/script>/); if(!m) throw Error('script missing'); new Function(m[1]); console.log('frontend syntax OK')"
+      - name: Commit V11.4.18 and clean workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rm -f .github/workflows/upgrade-v11418.yml .v11418-trigger
+          git add -A
+          git commit -m 'Deploy V11.4.18 unique Parions click target'
+          git push
