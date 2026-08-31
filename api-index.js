@@ -116,7 +116,45 @@ async function scrapeLigue1Maggle(page){
   });
 }
 
-const PS_L1_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-uber-eats/45452';
+const PS_L1_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-mcdonald-s/45452';
+function decodeHtmlText(html){
+  return String(html||'')
+    .replace(/<[^>]+>/g,' ')
+    .replace(/&nbsp;|&#160;/gi,' ')
+    .replace(/&amp;/gi,'&')
+    .replace(/&apos;|&#39;|&rsquo;/gi,"'")
+    .replace(/&quot;|&#34;/gi,'"')
+    .replace(/&ndash;|&mdash;|&#8211;|&#8212;/gi,'-')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function parseParionsL1EventsText(text){
+  const out=[], seen=new Set();
+  const re=/([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{1,38})\s*-\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'-]{1,38})\s+L1\s+McDonald'?s\s+N[°ºo]?\s*(\d+)\s+1\s*\/\s*N\s*\/\s*2/gi;
+  let m;
+  while((m=re.exec(String(text||'')))){
+    const home=m[1].trim(), away=m[2].trim(), eventNumber=Number(m[3]);
+    if(!home||!away||!Number.isFinite(eventNumber)||seen.has(eventNumber)) continue;
+    seen.add(eventNumber);
+    out.push({home,away,eventNumber,raw:m[0]});
+  }
+  return out;
+}
+async function fetchParionsL1EventsHttp(){
+  const r=await fetch(PS_L1_URL,{
+    headers:{
+      'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+      'accept':'text/html,application/xhtml+xml'
+    },
+    redirect:'follow'
+  });
+  if(!r.ok) throw new Error(`PARIONS_HTTP_${r.status}`);
+  const html=await r.text();
+  const events=parseParionsL1EventsText(decodeHtmlText(html));
+  if(!events.length) throw new Error('PARIONS_HTTP_NO_L1_EVENTS');
+  return events;
+}
+
 async function scrapeParionsL1Events(page){
   await page.goto(PS_L1_URL,{waitUntil:'domcontentloaded'});
   await page.waitForTimeout(1200);
@@ -480,7 +518,7 @@ async function clickMarkedTarget(page,method){
 
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.13',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.14',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
   diagnostic.inspect=await inspectEventAndChoose(page,b);
   if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
@@ -513,7 +551,7 @@ async function selectionConfirmed(page,b){
 
 
 
-const PS_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-uber-eats/45452';
+const PS_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-mcdonald-s/45452';
 
 async function setStake(page,b){
   const card=await findExactCartCard(page,b); if(!card) throw new Error(`Carte N°${b.eventNumber} ${b.outcome} introuvable.`);
@@ -570,15 +608,20 @@ async function validateAndQr(page,bets){
   throw new Error('QR Code officiel introuvable après validation.');
 }
 async function createBulletin(page,inputBets){
-  const events=await scrapeParionsL1Events(page);
+  let events=[];
+  if((inputBets||[]).some(b=>!Number(b.eventNumber))){
+    events=await fetchParionsL1EventsHttp();
+  }
   const resolved=(inputBets||[]).map(b=>{
+    if(Number(b.eventNumber)) return {...b,eventNumber:Number(b.eventNumber)};
     let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
     if(!e) e=(events||[]).find(x=>sameTeam(b.home,x.away)&&sameTeam(b.away,x.home));
     if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
     return {...b,eventNumber:e.eventNumber};
   });
   const bets=aggregateBets(resolved);
-  await page.waitForTimeout(300);
+  await page.goto(PS_URL,{waitUntil:'domcontentloaded'});
+  await page.waitForTimeout(1200);
   await dismissPrivacyOverlay(page);
   await page.waitForTimeout(600);
   await ensureSimpleMode(page);
@@ -604,29 +647,66 @@ async function createBulletin(page,inputBets){
 
 export const config = { maxDuration: 180 };
 
+function isTargetClosedError(e){
+  return /Target page, context or browser has been closed|Target closed|Browser has been closed|Protocol error.*closed/i.test(String(e?.message||e||''));
+}
+
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.13',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.14',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
       try{
         const page=await getPage(browser);
         const raw=await scrapeLigue1Maggle(page);
-        const events=await scrapeParionsL1Events(page);
+        let events=[];
+        try{ events=await fetchParionsL1EventsHttp(); }
+        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.13',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.14',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
     if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
+    if(action==='create-bulletin'){
+      const bets=req.body?.bets;
+      if(!Array.isArray(bets)||!bets.length) return res.status(400).json({ok:false,error:'Aucun pari reçu'});
+      let lastError=null;
+      for(let attempt=1;attempt<=2;attempt++){
+        let retryBrowser=null, retryPage=null;
+        try{
+          retryBrowser=await openRemoteBrowser();
+          retryPage=await getPage(retryBrowser);
+          const result=await createBulletin(retryPage, bets);
+          return res.status(200).json({ok:true,...result});
+        }catch(e){
+          lastError=e;
+          if(attempt<2 && isTargetClosedError(e)){
+            console.warn(`BROWSERLESS_TARGET_CLOSED_RETRY attempt=${attempt} ${String(e?.message||e)}`);
+          }else{
+            throw e;
+          }
+        }finally{
+          if(retryPage && !retryPage.isClosed()) await retryPage.close().catch(()=>{});
+          if(retryBrowser?.isConnected()) await retryBrowser.close().catch(()=>{});
+        }
+      }
+      throw lastError||new Error('BROWSERLESS_RETRY_FAILED');
+    }
     const browser=await openRemoteBrowser();
     try{
       const page=await getPage(browser);
-      if(action==='sync'){ const data=await scrapeLigue1Maggle(page); return res.status(200).json({ok:true,data}); }
+      if(action==='sync'){
+        const data=await scrapeLigue1Maggle(page);
+        let events=[];
+        try{ events=await fetchParionsL1EventsHttp(); }
+        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }
+        return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)});
+      }
       if(action==='create-bulletin'){
         const bets=req.body?.bets; if(!Array.isArray(bets)||!bets.length) return res.status(400).json({ok:false,error:'Aucun pari reçu'});
         return res.status(200).json({ok:true,...await createBulletin(page,bets)});
