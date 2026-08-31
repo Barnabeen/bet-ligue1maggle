@@ -480,7 +480,7 @@ async function clickMarkedTarget(page,method){
 
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
-  const diagnostic={version:'11.4.12',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.13',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   diagnostic.before={count:await uniqueSimpleCardCount(page),badge:await cartCount(page).catch(()=>null),cart:await snapshotCart(page)};
   diagnostic.inspect=await inspectEventAndChoose(page,b);
   if(!diagnostic.inspect?.ok) throw new SelectionDebugError(`DEBUG N°${b.eventNumber} ${b.outcome}: aucune cible déterministe trouvée.`,diagnostic);
@@ -570,9 +570,15 @@ async function validateAndQr(page,bets){
   throw new Error('QR Code officiel introuvable après validation.');
 }
 async function createBulletin(page,inputBets){
-  const bets=aggregateBets(inputBets);
-  await page.goto(PS_URL,{waitUntil:'domcontentloaded'});
-  await page.waitForTimeout(1200);
+  const events=await scrapeParionsL1Events(page);
+  const resolved=(inputBets||[]).map(b=>{
+    let e=(events||[]).find(x=>sameTeam(b.home,x.home)&&sameTeam(b.away,x.away));
+    if(!e) e=(events||[]).find(x=>sameTeam(b.home,x.away)&&sameTeam(b.away,x.home));
+    if(!e) throw new Error(`Correspondance Parions Sport introuvable pour ${b.home} – ${b.away}. Événements détectés: ${(events||[]).length}.`);
+    return {...b,eventNumber:e.eventNumber};
+  });
+  const bets=aggregateBets(resolved);
+  await page.waitForTimeout(300);
   await dismissPrivacyOverlay(page);
   await page.waitForTimeout(600);
   await ensureSimpleMode(page);
@@ -601,7 +607,7 @@ export const config = { maxDuration: 180 };
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.12',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.13',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -612,7 +618,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.12',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.13',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
@@ -620,7 +626,7 @@ export default async function handler(req,res){
     const browser=await openRemoteBrowser();
     try{
       const page=await getPage(browser);
-      if(action==='sync'){ const data=await scrapeLigue1Maggle(page); const events=await scrapeParionsL1Events(page); return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)}); }
+      if(action==='sync'){ const data=await scrapeLigue1Maggle(page); return res.status(200).json({ok:true,data}); }
       if(action==='create-bulletin'){
         const bets=req.body?.bets; if(!Array.isArray(bets)||!bets.length) return res.status(400).json({ok:false,error:'Aucun pari reçu'});
         return res.status(200).json({ok:true,...await createBulletin(page,bets)});
