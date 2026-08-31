@@ -366,14 +366,19 @@ class SelectionDebugError extends Error {
 
 async function findExactCartCard(page,b){
   const label=norm(expectedLabel(b)).toLowerCase();
+  const homeKey=teamKey(b.home), awayKey=teamKey(b.away);
   const cards=await simpleCards(page); const n=await cards.count();
   for(let i=0;i<n;i++){
     const c=cards.nth(i), text=norm(await c.innerText().catch(()=>''));
-    const eventRe=new RegExp(`(?:N[°ºo]?\\s*)?${String(b.eventNumber).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')}\\b`,'i');
-    if(!eventRe.test(text)) continue;
     const low=text.toLowerCase();
+    const eventRe=new RegExp(`(?:N[°ºo]?\\s*)?${String(b.eventNumber).replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')}\\b`,'i');
+    const textKey=teamKey(text);
+    const eventMatch=eventRe.test(text);
+    const teamsMatch=!!homeKey&&!!awayKey&&textKey.includes(homeKey)&&textKey.includes(awayKey);
+    if(!eventMatch && !teamsMatch) continue;
     if(label==='n'){
-      if(/(?:^|\s)N(?:\s|$)/i.test(text.split(/1\s*\/\s*N\s*\/\s*2/i).pop()||'') || /(?:^|\s)N(?:\s|$)/i.test(text)) return c;
+      const cleaned=text.replace(new RegExp('1\\s*/\\s*N\\s*/\\s*2','ig'),' ');
+      if(new RegExp('(?:^|\\s)N(?:\\s|$)','i').test(cleaned)) return c;
     }else if(low.includes(label)) return c;
   }
   return null;
@@ -470,7 +475,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.19: un seul marqueur de clic peut exister à la fois.
+    // V11.4.20: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -561,16 +566,21 @@ async function cartStakeInputIds(page){
   });
 }
 
-async function stakeInputForBet(page,b){
-  if(b?._stakeInputId){
-    const id=String(b._stakeInputId).replace(/"/g,'\\"');
-    const loc=page.locator(`input[id="${id}"]`).first();
-    if(await loc.count()) return loc;
-  }
+async function stakeInputForBet(page,b,index=null){
   const card=await findExactCartCard(page,b);
   if(card){
     const input=card.locator('input').first();
     if(await input.count()) return input;
+  }
+  const idx=Number.isInteger(index)?index:(Number.isInteger(b?._cartIndex)?b._cartIndex:null);
+  if(idx!==null){
+    const input=page.locator('.cart-item.simple').nth(idx).locator('input').first();
+    if(await input.count()) return input;
+  }
+  if(b?._stakeInputId){
+    const id=String(b._stakeInputId).replace(/"/g,'\\"');
+    const loc=page.locator(`input[id="${id}"]`).first();
+    if(await loc.count()) return loc;
   }
   return null;
 }
@@ -590,7 +600,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.19',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.20',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -641,20 +651,23 @@ async function selectionConfirmed(page,b){
 
 const PS_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-mcdonald-s/45452';
 
-async function setStake(page,b){
-  const input=await stakeInputForBet(page,b);
-  if(!input) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable (inputId=${b._stakeInputId||'aucun'}).`);
+async function setStake(page,b,index){
+  const input=await stakeInputForBet(page,b,index);
+  if(!input) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} introuvable (index=${index}, inputId=${b._stakeInputId||'aucun'}).`);
   const val=String(Number(b.stake));
   await input.fill(val);
   await page.waitForTimeout(70);
-  const got=Number(await input.inputValue());
-  if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée.`);
+  const check=await stakeInputForBet(page,b,index);
+  if(!check) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} disparue après saisie (index=${index}).`);
+  const got=Number(await check.inputValue());
+  if(Math.abs(got-Number(b.stake))>0.001) throw new Error(`Mise N°${b.eventNumber} ${b.outcome} non appliquée (${got} au lieu de ${b.stake}).`);
 }
+
 async function validateAndQr(page,bets){
   const uniqueCount=await uniqueSimpleCardCount(page);
   if(uniqueCount!==bets.length) throw new Error(`Contrôle panier : ${uniqueCount} carte(s) Simple unique(s) pour ${bets.length} sélection(s) attendue(s).`);
   let total=0;
-  for(const b of bets){ const input=await stakeInputForBet(page,b); if(!input) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome} (inputId=${b._stakeInputId||'aucun'}).`); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
+  for(let i=0;i<bets.length;i++){ const b=bets[i]; const input=await stakeInputForBet(page,b,i); if(!input) throw new Error(`Contrôle final impossible pour N°${b.eventNumber} ${b.outcome} (index=${i}, inputId=${b._stakeInputId||'aucun'}).`); const v=Number(await input.inputValue()); if(Math.abs(v-Number(b.stake))>.001) throw new Error(`Contrôle de mise incorrect pour N°${b.eventNumber} ${b.outcome}.`); total+=v; }
   const validateInfo = await page.evaluate(() => {
     const norm = s => String(s || '').replace(/\s+/g,' ').trim();
     const candidates = [...document.querySelectorAll('app-cart-content button, .cart-wrapper button, .cart-content button, button.button')];
@@ -733,9 +746,12 @@ async function createBulletin(page,inputBets){
       if(selected?.stakeInputId) bets[i]._stakeInputId=selected.stakeInputId;
     }
 
+    await page.waitForTimeout(250);
     const stakeIds=await cartStakeInputIds(page);
-    if(stakeIds.length===bets.length){
-      for(let i=0;i<bets.length;i++) if(!bets[i]._stakeInputId) bets[i]._stakeInputId=stakeIds[i];
+    if(stakeIds.length!==bets.length) throw new Error(`Binding des mises : ${stakeIds.length} champ(s) pour ${bets.length} pari(s).`);
+    for(let i=0;i<bets.length;i++){
+      bets[i]._cartIndex=i;
+      bets[i]._stakeInputId=stakeIds[i];
     }
 
     stage='contrôle final des sélections';
@@ -746,7 +762,7 @@ async function createBulletin(page,inputBets){
     }
 
     stage='application des mises';
-    for(const b of bets) await setStake(page,b);
+    for(let i=0;i<bets.length;i++) await setStake(page,bets[i],i);
     stage='validation et QR';
     return await validateAndQr(page,bets);
   }catch(e){
@@ -770,7 +786,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.19',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.20',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -783,7 +799,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.19',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.20',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
