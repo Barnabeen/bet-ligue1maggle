@@ -141,13 +141,13 @@ async function scrapeLigue1Maggle(page,targetEvents=[]){
     }
 
     let p=extractPronostics();
-    if(Array.isArray(targetEvents)&&targetEvents.length && p.overlap<5){
+    if(Array.isArray(targetEvents)&&targetEvents.length && p.overlap===0){
       for(let step=0;step<4;step++){
         const moved=await tryAdvanceJournee(p.journee);
         if(!moved) break;
         const next=extractPronostics();
         if(next.overlap>=p.overlap) p=next;
-        if(p.overlap>=5) break;
+        if(p.overlap>0) break;
       }
     }
 
@@ -582,7 +582,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.25: un seul marqueur de clic peut exister à la fois.
+    // V11.4.26: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -732,7 +732,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.25',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.26',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -823,7 +823,7 @@ async function validateAndQr(page,bets){
     return true;
   });
   if (!clicked) throw new Error('Bouton VALIDER détecté mais clic DOM impossible.');
-  // V11.4.25 : après VALIDER, le site affiche une action "QR CODE" dans
+  // V11.4.26 : après VALIDER, le site affiche une action "QR CODE" dans
   // le panier. Cliquer directement sur l'onglet "Mes QR codes" ne crée pas
   // l'e-bulletin : il faut d'abord déclencher cette action.
   const qrActionState = await page.waitForFunction(() => {
@@ -887,7 +887,7 @@ async function validateAndQr(page,bets){
   if(!qrTabState.ok) throw new Error('Onglet Mes QR codes détecté mais ouverture impossible.');
   await page.waitForTimeout(500);
 
-  // V11.4.25: le QR officiel n'est plus supposé être uniquement un <img>
+  // V11.4.26: le QR officiel n'est plus supposé être uniquement un <img>
   // PNG base64 de 100–190 px. Parions Sport peut le rendre en canvas, SVG,
   // blob/http ou dans un composant dont il faut capturer visuellement le carré.
   await page.waitForTimeout(450);
@@ -1056,7 +1056,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.25',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.26',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -1069,7 +1069,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.25',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.26',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
@@ -1108,8 +1108,8 @@ export default async function handler(req,res){
         catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }
         const data=await scrapeLigue1Maggle(page,events);
         const mapped=attachParionsNumbers(data,events);
-        if(events.length && mapped.mappingDiagnostics?.mapped<5){
-          throw new Error(`Synchronisation Ligue1Maggle incohérente : seulement ${mapped.mappingDiagnostics?.mapped||0}/${mapped.matchs?.length||0} match(s) correspondent aux paris Ligue 1 actuellement ouverts.`);
+        if(events.length && mapped.mappingDiagnostics?.mapped<1){
+          throw new Error(`Synchronisation Ligue1Maggle incohérente : aucun match Ligue1Maggle ne correspond aux paris Ligue 1 actuellement ouverts.`);
         }
         return res.status(200).json({ok:true,data:mapped});
       }
