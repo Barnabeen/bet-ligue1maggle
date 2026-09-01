@@ -2,7 +2,7 @@ name: Upgrade V11.4.25
 on:
   push:
     paths:
-      - '.github/workflows/upgrade-v11425.yml'
+      - '.v11425-trigger'
 permissions:
   contents: write
 jobs:
@@ -10,214 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Patch V11.4.25
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          p=Path('api/index.js')
-          s=p.read_text()
-
-          a=s.index('async function scrapeLigue1Maggle(page){')
-          z=s.index('\nconst PS_L1_URL =',a)
-          replacement=r'''async function scrapeLigue1Maggle(page,targetEvents=[]){
-  await page.goto(L1_URL,{waitUntil:'domcontentloaded'});
-  await page.waitForTimeout(1200);
-  return await page.evaluate(async(targetEvents)=>{
-    const sleep = ms => new Promise(r => setTimeout(r, ms));
-    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-    const txt = el => norm(el?.innerText || el?.textContent || '');
-    const visible = el => {
-      if(!el) return false;
-      const r=el.getBoundingClientRect();
-      const cs=getComputedStyle(el);
-      return r.width>0 && r.height>0 && cs.display!=='none' && cs.visibility!=='hidden';
-    };
-    const teamKey=s=>String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
-      .replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ')
-      .replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();
-    const sameTeam=(a,b)=>{const x=teamKey(a),y=teamKey(b);return !!x&&!!y&&(x===y||x.includes(y)||y.includes(x));};
-
-    function clickText(re) {
-      const els = [...document.querySelectorAll('button,a,[role="button"],nav *')].filter(visible);
-      const el = els.find(e => re.test(txt(e)));
-      if (el) { el.click(); return true; }
-      return false;
-    }
-    async function go(re) { clickText(re); await sleep(700); }
-
-    clickText(/Ouais ouais|j.?assume/i);
-    await sleep(400);
-    await go(/pronostics?|grille/i);
-
-    function journeeForTable(table){
-      let cur=table;
-      for(let depth=0;cur&&depth<6;depth++,cur=cur.parentElement){
-        const local=[...cur.querySelectorAll('h1,h2,h3,h4,h5,h6,[class*="jour" i],button,span,div')]
-          .map(el=>txt(el)).filter(t=>/^JOURN[ÉE]E?\s*\d+$/i.test(t));
-        const unique=[...new Set(local.map(t=>+(t.match(/(\d+)/)||[])[1]).filter(Number.isFinite))];
-        if(unique.length===1) return unique[0];
-        let sib=cur.previousElementSibling;
-        for(let i=0;sib&&i<4;i++,sib=sib.previousElementSibling){
-          const m=txt(sib).match(/JOURN[ÉE]E?\s*(\d+)/i);
-          if(m && txt(sib).length<120) return +m[1];
-        }
-      }
-      const labels=[...document.querySelectorAll('*')].filter(el=>visible(el)&&/^JOURN[ÉE]E?\s*\d+$/i.test(txt(el)));
-      const nums=[...new Set(labels.map(el=>+(txt(el).match(/(\d+)/)||[])[1]).filter(Number.isFinite))];
-      if(nums.length===1) return nums[0];
-      return null;
-    }
-
-    function parseTable(table){
-      const rows=[...table.querySelectorAll('tr')];
-      if(rows.length<3 || !rows.some(r=>/\bvs\b/i.test(txt(r)))) return null;
-      const headerCells=[...rows[0].querySelectorAll('th,td')].map(txt);
-      const playerNames=headerCells.slice(1).filter(Boolean);
-      const matchs=[];
-      for(const row of rows.slice(1)){
-        const cells=[...row.querySelectorAll('th,td')];
-        if(!cells.length) continue;
-        const first=txt(cells[0]);
-        const mm=first.match(/(.+?)\s+vs\s+(.+?)(?:\s+(?:ven|sam|dim|lun|mar|mer|jeu)\.?|\s+\d{1,2}:\d{2}|$)/i);
-        if(!mm) continue;
-        const pronostics={};
-        cells.slice(1).forEach((c,i)=>{
-          const raw=txt(c).trim();
-          const v=raw.match(/^(1|N|2|X|✗)$/i)?.[1]?.toUpperCase();
-          if(playerNames[i]&&v) pronostics[playerNames[i]]=v;
-        });
-        matchs.push({domicile:norm(mm[1]),exterieur:norm(mm[2]),pronostics});
-      }
-      if(matchs.length<5) return null;
-      return {journee:journeeForTable(table),matchs,joueurs:playerNames,visible:visible(table)};
-    }
-
-    function overlapWithParions(matchs){
-      if(!Array.isArray(targetEvents)||!targetEvents.length) return 0;
-      return matchs.filter(m=>targetEvents.some(e=>
-        (sameTeam(m.domicile,e.home)&&sameTeam(m.exterieur,e.away)) ||
-        (sameTeam(m.domicile,e.away)&&sameTeam(m.exterieur,e.home))
-      )).length;
-    }
-
-    function extractPronostics(){
-      const candidates=[...document.querySelectorAll('table')].map(parseTable).filter(Boolean)
-        .map((c,i)=>({...c,index:i,overlap:overlapWithParions(c.matchs)}));
-      if(!candidates.length) return {journee:null,matchs:[],joueurs:[],warning:'Table de pronostics non reconnue.',diagnostics:{candidates:[]}};
-      candidates.sort((a,b)=>b.overlap-a.overlap || Number(b.visible)-Number(a.visible) || b.matchs.length-a.matchs.length);
-      const best=candidates[0];
-      return {...best,diagnostics:{candidates:candidates.map(c=>({index:c.index,journee:c.journee,visible:c.visible,overlap:c.overlap,matchs:c.matchs.map(m=>`${m.domicile}-${m.exterieur}`)})),selected:{index:best.index,journee:best.journee,visible:best.visible,overlap:best.overlap}}};
-    }
-
-    async function tryAdvanceJournee(currentJournee){
-      const selects=[...document.querySelectorAll('select')].filter(visible);
-      for(const sel of selects){
-        const opts=[...sel.options];
-        const idx=sel.selectedIndex;
-        const next=opts.find((o,i)=>i>idx && /JOURN[ÉE]E?|J\s*\d+/i.test(txt(o))) || opts[idx+1];
-        if(next){
-          sel.value=next.value;
-          sel.dispatchEvent(new Event('input',{bubbles:true}));
-          sel.dispatchEvent(new Event('change',{bubbles:true}));
-          await sleep(500);
-          return true;
-        }
-      }
-      const controls=[...document.querySelectorAll('button,a,[role="button"]')].filter(visible);
-      const wanted=controls.find(el=>{
-        const t=norm([txt(el),el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '));
-        return /(?:journ[ée]e?.*)?(suiv|next|prochain)|^(?:>|›|»|→)$/i.test(t);
-      });
-      if(wanted){ wanted.click(); await sleep(500); return true; }
-      if(Number.isFinite(currentJournee)){
-        const byNumber=controls.find(el=>{
-          const t=txt(el);
-          return new RegExp(`^(?:J(?:OURN[ÉE]E?)?\\s*)?${currentJournee+1}$`,'i').test(t);
-        });
-        if(byNumber){ byNumber.click(); await sleep(500); return true; }
-      }
-      return false;
-    }
-
-    let p=extractPronostics();
-    if(Array.isArray(targetEvents)&&targetEvents.length && p.overlap<5){
-      for(let step=0;step<4;step++){
-        const moved=await tryAdvanceJournee(p.journee);
-        if(!moved) break;
-        const next=extractPronostics();
-        if(next.overlap>=p.overlap) p=next;
-        if(p.overlap>=5) break;
-      }
-    }
-
-    const knownPlayers=p.joueurs;
-    await go(/classement/i);
-
-    function pointsNearPlayer(player) {
-      const candidates = [...document.querySelectorAll('div,li,tr,article,section')];
-      const hits = candidates.filter(el => {
-        const t = txt(el);
-        if (!t.toUpperCase().includes(player.toUpperCase())) return false;
-        if (!/\d+(?:[.,]\d+)?\s*pts?\b/i.test(t)) return false;
-        return ![...el.children].some(c => {
-          const ct = txt(c);
-          return ct.toUpperCase().includes(player.toUpperCase()) && /\d+(?:[.,]\d+)?\s*pts?\b/i.test(ct);
-        });
-      });
-      for (const el of hits) {
-        const m = txt(el).match(/(\d+(?:[.,]\d+)?)\s*pts?\b/i);
-        if (m) return parseFloat(m[1].replace(',', '.'));
-      }
-      const nameEls = [...document.querySelectorAll('*')].filter(el => {
-        const t = txt(el);
-        return t && t.toUpperCase() === player.toUpperCase();
-      });
-      for (const nameEl of nameEls) {
-        let cur = nameEl;
-        for (let i=0; i<5 && cur; i++, cur=cur.parentElement) {
-          const m = txt(cur).match(/(\d+(?:[.,]\d+)?)\s*pts?\b/i);
-          if (m) return parseFloat(m[1].replace(',', '.'));
-        }
-      }
-      return null;
-    }
-
-    const classement = knownPlayers
-      .map(joueur => ({ joueur, points: pointsNearPlayer(joueur) }))
-      .filter(x => Number.isFinite(x.points))
-      .sort((a,b) => b.points - a.points)
-      .map((x,i) => ({ rang:i+1, ...x }));
-
-    return {journee:p.journee,classement,matchs:p.matchs,sourceDiagnostics:p.diagnostics};
-  },targetEvents);
-}
-'''
-          s=s[:a]+replacement+s[z:]
-
-          old="""        const page=await getPage(browser);\n        const raw=await scrapeLigue1Maggle(page);\n        let events=[];\n        try{ events=await fetchParionsL1EventsHttp(); }\n        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }\n        const data=attachParionsNumbers(raw,events);\n"""
-          new="""        const page=await getPage(browser);\n        let events=[];\n        try{ events=await fetchParionsL1EventsHttp(); }\n        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }\n        const raw=await scrapeLigue1Maggle(page,events);\n        const data=attachParionsNumbers(raw,events);\n"""
-          if old not in s: raise SystemExit('debug-sync block not found')
-          s=s.replace(old,new,1)
-
-          old="""      if(action==='sync'){\n        const data=await scrapeLigue1Maggle(page);\n        let events=[];\n        try{ events=await fetchParionsL1EventsHttp(); }\n        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }\n        return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)});\n      }\n"""
-          new="""      if(action==='sync'){\n        let events=[];\n        try{ events=await fetchParionsL1EventsHttp(); }\n        catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }\n        const data=await scrapeLigue1Maggle(page,events);\n        const mapped=attachParionsNumbers(data,events);\n        if(events.length && mapped.mappingDiagnostics?.mapped<5){\n          throw new Error(`Synchronisation Ligue1Maggle incohérente : seulement ${mapped.mappingDiagnostics?.mapped||0}/${mapped.matchs?.length||0} match(s) correspondent aux paris Ligue 1 actuellement ouverts.`);\n        }\n        return res.status(200).json({ok:true,data:mapped});\n      }\n"""
-          if old not in s: raise SystemExit('sync block not found')
-          s=s.replace(old,new,1)
-
-          s=s.replace('11.4.24','11.4.25')
-          p.write_text(s)
-          p=Path('index.html'); p.write_text(p.read_text().replace('V11.4.24','V11.4.25'))
-          p=Path('package.json'); p.write_text(p.read_text().replace('"version":"11.4.24"','"version":"11.4.25"'))
-          PY
-      - name: Validate JavaScript
+      - name: Patch
+        run: python .v11425_patch.py
+      - name: Validate
         run: |
           node --check api/index.js
-          node -e "const fs=require('fs');const h=fs.readFileSync('index.html','utf8');const m=h.match(/<script>([\\s\\S]*?)<\\/script>/);if(!m)throw Error('script missing');new Function(m[1]);console.log('frontend syntax OK')"
-      - name: Commit V11.4.25
+          node -e "const fs=require('fs');const h=fs.readFileSync('index.html','utf8');const m=h.match(/<script>([\\s\\S]*?)<\\/script>/);if(!m)throw Error('script missing');new Function(m[1]);"
+      - name: Commit
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/upgrade-v11425.yml
+          rm -f .github/workflows/upgrade-v11425.yml .v11425_patch.py .v11425-trigger
           git add -A
           git commit -m 'Deploy V11.4.25 sync current Ligue1Maggle matchday'
           git push
