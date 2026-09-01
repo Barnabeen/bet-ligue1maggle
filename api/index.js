@@ -71,7 +71,7 @@ async function scrapeLigue1Maggle(page,targetEvents=[]){
 
     function parseTable(table){
       const rows=[...table.querySelectorAll('tr')];
-      if(rows.length<3 || !rows.some(r=>/\bvs\b/i.test(txt(r)))) return null;
+      if(rows.length<2 || !rows.some(r=>/\bvs\b/i.test(txt(r)))) return null;
       const headerCells=[...rows[0].querySelectorAll('th,td')].map(txt);
       const playerNames=headerCells.slice(1).filter(Boolean);
       const matchs=[];
@@ -89,7 +89,7 @@ async function scrapeLigue1Maggle(page,targetEvents=[]){
         });
         matchs.push({domicile:norm(mm[1]),exterieur:norm(mm[2]),pronostics});
       }
-      if(matchs.length<5) return null;
+      if(!matchs.length) return null;
       return {journee:journeeForTable(table),matchs,joueurs:playerNames,visible:visible(table)};
     }
 
@@ -110,46 +110,87 @@ async function scrapeLigue1Maggle(page,targetEvents=[]){
       return {...best,diagnostics:{candidates:candidates.map(c=>({index:c.index,journee:c.journee,visible:c.visible,overlap:c.overlap,matchs:c.matchs.map(m=>`${m.domicile}-${m.exterieur}`)})),selected:{index:best.index,journee:best.journee,visible:best.visible,overlap:best.overlap}}};
     }
 
-    async function tryAdvanceJournee(currentJournee){
-      const selects=[...document.querySelectorAll('select')].filter(visible);
-      for(const sel of selects){
-        const opts=[...sel.options];
-        const idx=sel.selectedIndex;
-        const next=opts.find((o,i)=>i>idx && /JOURN[ÉE]E?|J\s*\d+/i.test(txt(o))) || opts[idx+1];
-        if(next){
-          sel.value=next.value;
-          sel.dispatchEvent(new Event('input',{bubbles:true}));
-          sel.dispatchEvent(new Event('change',{bubbles:true}));
-          await sleep(500);
-          return true;
-        }
-      }
-      const controls=[...document.querySelectorAll('button,a,[role="button"]')].filter(visible);
-      const wanted=controls.find(el=>{
-        const t=norm([txt(el),el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '));
-        return /(?:journ[ée]e?.*)?(suiv|next|prochain)|^(?:>|›|»|→)$/i.test(t);
-      });
-      if(wanted){ wanted.click(); await sleep(500); return true; }
-      if(Number.isFinite(currentJournee)){
-        const byNumber=controls.find(el=>{
-          const t=txt(el);
-          return new RegExp(`^(?:J(?:OURN[ÉE]E?)?\\s*)?${currentJournee+1}$`,'i').test(t);
-        });
-        if(byNumber){ byNumber.click(); await sleep(500); return true; }
-      }
-      return false;
+    function betterCandidate(a,b){
+      if(!a) return b;
+      if(!b) return a;
+      if((b.overlap||0)!==(a.overlap||0)) return (b.overlap||0)>(a.overlap||0)?b:a;
+      if(Number(!!b.visible)!==Number(!!a.visible)) return b.visible?b:a;
+      if((b.journee||0)!==(a.journee||0)) return (b.journee||0)>(a.journee||0)?b:a;
+      return (b.matchs?.length||0)>(a.matchs?.length||0)?b:a;
     }
 
-    let p=extractPronostics();
-    if(Array.isArray(targetEvents)&&targetEvents.length && p.overlap===0){
-      for(let step=0;step<4;step++){
-        const moved=await tryAdvanceJournee(p.journee);
-        if(!moved) break;
-        const next=extractPronostics();
-        if(next.overlap>=p.overlap) p=next;
-        if(p.overlap>0) break;
+    async function probeCurrentMatchday(){
+      let best=extractPronostics();
+      const probes=[];
+      const record=(label,c)=>{
+        probes.push({label,journee:c?.journee??null,overlap:c?.overlap||0,visible:!!c?.visible,matchs:c?.matchs?.map(m=>`${m.domicile}-${m.exterieur}`)||[]});
+        best=betterCandidate(best,c);
+      };
+      const targetCount=Array.isArray(targetEvents)?targetEvents.length:0;
+      const enough=c=>targetCount>0 && (c?.overlap||0)>=Math.min(targetCount,Math.max(1,c?.matchs?.length||1));
+      record('initial',best);
+      if(enough(best)) return {...best,probeDiagnostics:probes};
+
+      const isRoundSelect=sel=>{
+        const meta=norm([sel.id,sel.name,sel.className,sel.getAttribute('aria-label')].filter(Boolean).join(' '));
+        const opts=[...sel.options].map(o=>txt(o));
+        return /jour|round|week|matchday/i.test(meta) || opts.filter(t=>/JOURN[ÉE]E?|^J\s*\d+|^\d{1,2}$/i.test(t)).length>=2;
+      };
+      const selectCount=[...document.querySelectorAll('select')].filter(visible).filter(isRoundSelect).length;
+      for(let si=0;si<selectCount;si++){
+        const initialSel=[...document.querySelectorAll('select')].filter(visible).filter(isRoundSelect)[si];
+        if(!initialSel) continue;
+        const options=[...initialSel.options].map(o=>({value:o.value,text:txt(o)}));
+        for(const o of options){
+          const sel=[...document.querySelectorAll('select')].filter(visible).filter(isRoundSelect)[si];
+          if(!sel) continue;
+          sel.value=o.value;
+          sel.dispatchEvent(new Event('input',{bubbles:true}));
+          sel.dispatchEvent(new Event('change',{bubbles:true}));
+          await sleep(350);
+          const c=extractPronostics(); record(`select:${si}:${o.text}`,c);
+          if(enough(c)) return {...c,probeDiagnostics:probes};
+        }
       }
+
+      const roundControls=()=>[...document.querySelectorAll('button,a,[role="button"]')].filter(el=>{
+        if(!visible(el)) return false;
+        const t=txt(el);
+        const meta=norm([t,el.id,el.className,el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '));
+        if(/journ[ée]e|matchday|round|week|semaine/i.test(meta)) return true;
+        if(!/^(?:J(?:OURN[ÉE]E?)?\s*)?\d{1,2}$/i.test(t)) return false;
+        let cur=el.parentElement;
+        for(let d=0;cur&&d<4;d++,cur=cur.parentElement){
+          const ctx=norm([cur.id,cur.className,txt(cur)].filter(Boolean).join(' '));
+          if(/journ[ée]e|matchday|round|week|semaine/i.test(ctx)) return true;
+        }
+        return false;
+      });
+      const labels=[...new Set(roundControls().map(el=>norm([txt(el),el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '))).filter(Boolean))];
+      for(const label of labels){
+        const el=roundControls().find(x=>norm([txt(x),x.getAttribute('aria-label'),x.getAttribute('title')].filter(Boolean).join(' '))===label);
+        if(!el) continue;
+        try{el.click();}catch{continue;}
+        await sleep(380);
+        const c=extractPronostics(); record(`control:${label}`,c);
+        if(enough(c)) return {...c,probeDiagnostics:probes};
+      }
+
+      for(let step=0;step<10;step++){
+        const next=[...document.querySelectorAll('button,a,[role="button"]')].filter(visible).find(el=>{
+          const t=norm([txt(el),el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '));
+          return /(?:journ[ée]e?.*)?(suiv|next|prochain)|^(?:>|›|»|→)$/i.test(t);
+        });
+        if(!next) break;
+        next.click(); await sleep(380);
+        const c=extractPronostics(); record(`next:${step+1}`,c);
+        if(enough(c)) return {...c,probeDiagnostics:probes};
+      }
+      return {...best,probeDiagnostics:probes};
     }
+
+    let p=await probeCurrentMatchday();
+    p.diagnostics={...(p.diagnostics||{}),probes:p.probeDiagnostics||[]};
 
     const knownPlayers=p.joueurs;
     await go(/classement/i);
@@ -582,7 +623,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.26: un seul marqueur de clic peut exister à la fois.
+    // V11.4.27: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -732,7 +773,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.26',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.27',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -823,7 +864,7 @@ async function validateAndQr(page,bets){
     return true;
   });
   if (!clicked) throw new Error('Bouton VALIDER détecté mais clic DOM impossible.');
-  // V11.4.26 : après VALIDER, le site affiche une action "QR CODE" dans
+  // V11.4.27 : après VALIDER, le site affiche une action "QR CODE" dans
   // le panier. Cliquer directement sur l'onglet "Mes QR codes" ne crée pas
   // l'e-bulletin : il faut d'abord déclencher cette action.
   const qrActionState = await page.waitForFunction(() => {
@@ -887,7 +928,7 @@ async function validateAndQr(page,bets){
   if(!qrTabState.ok) throw new Error('Onglet Mes QR codes détecté mais ouverture impossible.');
   await page.waitForTimeout(500);
 
-  // V11.4.26: le QR officiel n'est plus supposé être uniquement un <img>
+  // V11.4.27: le QR officiel n'est plus supposé être uniquement un <img>
   // PNG base64 de 100–190 px. Parions Sport peut le rendre en canvas, SVG,
   // blob/http ou dans un composant dont il faut capturer visuellement le carré.
   await page.waitForTimeout(450);
@@ -1056,7 +1097,7 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.26',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.27',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
@@ -1069,7 +1110,7 @@ export default async function handler(req,res){
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.26',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.27',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
@@ -1109,7 +1150,8 @@ export default async function handler(req,res){
         const data=await scrapeLigue1Maggle(page,events);
         const mapped=attachParionsNumbers(data,events);
         if(events.length && mapped.mappingDiagnostics?.mapped<1){
-          throw new Error(`Synchronisation Ligue1Maggle incohérente : aucun match Ligue1Maggle ne correspond aux paris Ligue 1 actuellement ouverts.`);
+          const probes=(mapped.sourceDiagnostics?.probes||[]).map(p=>`${p.label}[J${p.journee??'?'}:${p.overlap}]`).join(' > ');
+          throw new Error(`Synchronisation Ligue1Maggle incohérente : aucun match Ligue1Maggle ne correspond aux paris Ligue 1 actuellement ouverts. Navigation testée: ${probes||'aucun contrôle de journée détecté'}.`);
         }
         return res.status(200).json({ok:true,data:mapped});
       }
