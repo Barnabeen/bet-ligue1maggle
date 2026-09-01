@@ -20,16 +20,26 @@ async function getPage(browser){
   return page;
 }
 
-async function scrapeLigue1Maggle(page){
+async function scrapeLigue1Maggle(page,targetEvents=[]){
   await page.goto(L1_URL,{waitUntil:'domcontentloaded'});
   await page.waitForTimeout(1200);
-  return await page.evaluate(async()=>{
+  return await page.evaluate(async(targetEvents)=>{
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const norm = s => (s || '').replace(/\s+/g, ' ').trim();
     const txt = el => norm(el?.innerText || el?.textContent || '');
+    const visible = el => {
+      if(!el) return false;
+      const r=el.getBoundingClientRect();
+      const cs=getComputedStyle(el);
+      return r.width>0 && r.height>0 && cs.display!=='none' && cs.visibility!=='hidden';
+    };
+    const teamKey=s=>String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+      .replace(/\b(fc|ac|as|stade|olympique|club)\b/g,' ')
+      .replace(/[^a-z0-9]+/g,' ').replace(/\s+/g,' ').trim();
+    const sameTeam=(a,b)=>{const x=teamKey(a),y=teamKey(b);return !!x&&!!y&&(x===y||x.includes(y)||y.includes(x));};
 
     function clickText(re) {
-      const els = [...document.querySelectorAll('button,a,[role="button"],nav *')];
+      const els = [...document.querySelectorAll('button,a,[role="button"],nav *')].filter(visible);
       const el = els.find(e => re.test(txt(e)));
       if (el) { el.click(); return true; }
       return false;
@@ -40,43 +50,108 @@ async function scrapeLigue1Maggle(page){
     await sleep(400);
     await go(/pronostics?|grille/i);
 
-    function extractPronostics() {
-      let journee = null;
-      const pageText = txt(document.body);
-      const jm = pageText.match(/JOURN[ÉE]E?\s*(\d+)/i);
-      if (jm) journee = +jm[1];
-
-      const tables = [...document.querySelectorAll('table')];
-      for (const table of tables) {
-        const rows = [...table.querySelectorAll('tr')];
-        if (rows.length < 3 || !rows.some(r => /\bvs\b/i.test(txt(r)))) continue;
-
-        const headerCells = [...rows[0].querySelectorAll('th,td')].map(txt);
-        const playerNames = headerCells.slice(1).filter(Boolean);
-        const matchs = [];
-
-        for (const row of rows.slice(1)) {
-          const cells = [...row.querySelectorAll('th,td')];
-          if (!cells.length) continue;
-          const first = txt(cells[0]);
-          const mm = first.match(/(.+?)\s+vs\s+(.+?)(?:\s+(?:ven|sam|dim|lun|mar|mer|jeu)\.?|\s+\d{1,2}:\d{2}|$)/i);
-          if (!mm) continue;
-
-          const pronostics = {};
-          cells.slice(1).forEach((c,i) => {
-            const raw = txt(c).trim();
-            const v = raw.match(/^(1|N|2|X|✗)$/i)?.[1]?.toUpperCase();
-            if (playerNames[i] && v) pronostics[playerNames[i]] = v;
-          });
-          matchs.push({domicile:norm(mm[1]), exterieur:norm(mm[2]), pronostics});
+    function journeeForTable(table){
+      let cur=table;
+      for(let depth=0;cur&&depth<6;depth++,cur=cur.parentElement){
+        const local=[...cur.querySelectorAll('h1,h2,h3,h4,h5,h6,[class*="jour" i],button,span,div')]
+          .map(el=>txt(el)).filter(t=>/^JOURN[ÉE]E?\s*\d+$/i.test(t));
+        const unique=[...new Set(local.map(t=>+(t.match(/(\d+)/)||[])[1]).filter(Number.isFinite))];
+        if(unique.length===1) return unique[0];
+        let sib=cur.previousElementSibling;
+        for(let i=0;sib&&i<4;i++,sib=sib.previousElementSibling){
+          const m=txt(sib).match(/JOURN[ÉE]E?\s*(\d+)/i);
+          if(m && txt(sib).length<120) return +m[1];
         }
-        if (matchs.length >= 5) return { journee, matchs, joueurs: playerNames };
       }
-      return { journee, matchs: [], joueurs: [], warning: 'Table de pronostics non reconnue.' };
+      const labels=[...document.querySelectorAll('*')].filter(el=>visible(el)&&/^JOURN[ÉE]E?\s*\d+$/i.test(txt(el)));
+      const nums=[...new Set(labels.map(el=>+(txt(el).match(/(\d+)/)||[])[1]).filter(Number.isFinite))];
+      if(nums.length===1) return nums[0];
+      return null;
     }
 
-    const p = extractPronostics();
-    const knownPlayers = p.joueurs;
+    function parseTable(table){
+      const rows=[...table.querySelectorAll('tr')];
+      if(rows.length<3 || !rows.some(r=>/\bvs\b/i.test(txt(r)))) return null;
+      const headerCells=[...rows[0].querySelectorAll('th,td')].map(txt);
+      const playerNames=headerCells.slice(1).filter(Boolean);
+      const matchs=[];
+      for(const row of rows.slice(1)){
+        const cells=[...row.querySelectorAll('th,td')];
+        if(!cells.length) continue;
+        const first=txt(cells[0]);
+        const mm=first.match(/(.+?)\s+vs\s+(.+?)(?:\s+(?:ven|sam|dim|lun|mar|mer|jeu)\.?|\s+\d{1,2}:\d{2}|$)/i);
+        if(!mm) continue;
+        const pronostics={};
+        cells.slice(1).forEach((c,i)=>{
+          const raw=txt(c).trim();
+          const v=raw.match(/^(1|N|2|X|✗)$/i)?.[1]?.toUpperCase();
+          if(playerNames[i]&&v) pronostics[playerNames[i]]=v;
+        });
+        matchs.push({domicile:norm(mm[1]),exterieur:norm(mm[2]),pronostics});
+      }
+      if(matchs.length<5) return null;
+      return {journee:journeeForTable(table),matchs,joueurs:playerNames,visible:visible(table)};
+    }
+
+    function overlapWithParions(matchs){
+      if(!Array.isArray(targetEvents)||!targetEvents.length) return 0;
+      return matchs.filter(m=>targetEvents.some(e=>
+        (sameTeam(m.domicile,e.home)&&sameTeam(m.exterieur,e.away)) ||
+        (sameTeam(m.domicile,e.away)&&sameTeam(m.exterieur,e.home))
+      )).length;
+    }
+
+    function extractPronostics(){
+      const candidates=[...document.querySelectorAll('table')].map(parseTable).filter(Boolean)
+        .map((c,i)=>({...c,index:i,overlap:overlapWithParions(c.matchs)}));
+      if(!candidates.length) return {journee:null,matchs:[],joueurs:[],warning:'Table de pronostics non reconnue.',overlap:0,diagnostics:{candidates:[]}};
+      candidates.sort((a,b)=>b.overlap-a.overlap || Number(b.visible)-Number(a.visible) || b.matchs.length-a.matchs.length);
+      const best=candidates[0];
+      return {...best,diagnostics:{candidates:candidates.map(c=>({index:c.index,journee:c.journee,visible:c.visible,overlap:c.overlap,matchs:c.matchs.map(m=>`${m.domicile}-${m.exterieur}`)})),selected:{index:best.index,journee:best.journee,visible:best.visible,overlap:best.overlap}}};
+    }
+
+    async function tryAdvanceJournee(currentJournee){
+      const selects=[...document.querySelectorAll('select')].filter(visible);
+      for(const sel of selects){
+        const opts=[...sel.options];
+        const idx=sel.selectedIndex;
+        const next=opts.find((o,i)=>i>idx && /JOURN[ÉE]E?|J\s*\d+/i.test(txt(o))) || opts[idx+1];
+        if(next){
+          sel.value=next.value;
+          sel.dispatchEvent(new Event('input',{bubbles:true}));
+          sel.dispatchEvent(new Event('change',{bubbles:true}));
+          await sleep(500);
+          return true;
+        }
+      }
+      const controls=[...document.querySelectorAll('button,a,[role="button"]')].filter(visible);
+      const wanted=controls.find(el=>{
+        const t=norm([txt(el),el.getAttribute('aria-label'),el.getAttribute('title')].filter(Boolean).join(' '));
+        return /(?:journ[ée]e?.*)?(suiv|next|prochain)|^(?:>|›|»|→)$/i.test(t);
+      });
+      if(wanted){ wanted.click(); await sleep(500); return true; }
+      if(Number.isFinite(currentJournee)){
+        const byNumber=controls.find(el=>{
+          const t=txt(el);
+          return new RegExp(`^(?:J(?:OURN[ÉE]E?)?\\s*)?${currentJournee+1}$`,'i').test(t);
+        });
+        if(byNumber){ byNumber.click(); await sleep(500); return true; }
+      }
+      return false;
+    }
+
+    let p=extractPronostics();
+    if(Array.isArray(targetEvents)&&targetEvents.length && p.overlap<5){
+      for(let step=0;step<4;step++){
+        const moved=await tryAdvanceJournee(p.journee);
+        if(!moved) break;
+        const next=extractPronostics();
+        if(next.overlap>=p.overlap) p=next;
+        if(p.overlap>=5) break;
+      }
+    }
+
+    const knownPlayers=p.joueurs;
     await go(/classement/i);
 
     function pointsNearPlayer(player) {
@@ -114,8 +189,8 @@ async function scrapeLigue1Maggle(page){
       .sort((a,b) => b.points - a.points)
       .map((x,i) => ({ rang:i+1, ...x }));
 
-    return {journee:p.journee, classement, matchs:p.matchs};
-  });
+    return {journee:p.journee,classement,matchs:p.matchs,sourceDiagnostics:p.diagnostics};
+  },targetEvents);
 }
 
 const PS_L1_URL = 'https://www.pointdevente.parionssport.fdj.fr/paris-ouverts/football/l1-mcdonald-s/45452';
@@ -507,7 +582,7 @@ async function inspectEventAndChoose(page,b){
       return {el,idx,score,composite:composite.slice(0,300),desc:describe(el)};
     }).filter(x=>x.score>=0).sort((a,b)=>b.score-a.score||a.idx-b.idx);
     const chosen=scored[0]?.el||null;
-    // V11.4.24: un seul marqueur de clic peut exister à la fois.
+    // V11.4.25: un seul marqueur de clic peut exister à la fois.
     // Les anciennes versions laissaient les marqueurs des matchs précédents,
     // puis clickMarkedTarget(...).first() recliquait la première cote du DOM.
     document.querySelectorAll('[data-l1-debug-target="1"]').forEach(el=>{
@@ -657,7 +732,7 @@ async function waitCartAtLeast(page,minCount,timeoutMs){
 async function ensureUniqueSelection(page,b){
   if(await findExactCartCard(page,b)) return {via:'cart-existing'};
 
-  const diagnostic={version:'11.4.24',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
+  const diagnostic={version:'11.4.25',bet:{eventNumber:b.eventNumber,home:b.home,away:b.away,outcome:b.outcome,stake:b.stake},before:null,inspect:null,attempts:[]};
   const before=await fastCartCount(page);
   const beforeInputIds=await cartStakeInputIds(page);
   diagnostic.before={count:before,inputIds:beforeInputIds};
@@ -748,7 +823,7 @@ async function validateAndQr(page,bets){
     return true;
   });
   if (!clicked) throw new Error('Bouton VALIDER détecté mais clic DOM impossible.');
-  // V11.4.24 : après VALIDER, le site affiche une action "QR CODE" dans
+  // V11.4.25 : après VALIDER, le site affiche une action "QR CODE" dans
   // le panier. Cliquer directement sur l'onglet "Mes QR codes" ne crée pas
   // l'e-bulletin : il faut d'abord déclencher cette action.
   const qrActionState = await page.waitForFunction(() => {
@@ -812,7 +887,7 @@ async function validateAndQr(page,bets){
   if(!qrTabState.ok) throw new Error('Onglet Mes QR codes détecté mais ouverture impossible.');
   await page.waitForTimeout(500);
 
-  // V11.4.24: le QR officiel n'est plus supposé être uniquement un <img>
+  // V11.4.25: le QR officiel n'est plus supposé être uniquement un <img>
   // PNG base64 de 100–190 px. Parions Sport peut le rendre en canvas, SVG,
   // blob/http ou dans un composant dont il faut capturer visuellement le carré.
   await page.waitForTimeout(450);
@@ -981,20 +1056,20 @@ function isTargetClosedError(e){
 export default async function handler(req,res){
   try{
     const action=String(req.query?.action||'health');
-    if(action==='health') return res.status(200).json({ok:true,version:'11.4.24',browserlessConfigured:browserlessConfigured()});
+    if(action==='health') return res.status(200).json({ok:true,version:'11.4.25',browserlessConfigured:browserlessConfigured()});
     if(action==='debug-sync'){
       if(!browserlessConfigured()) return res.status(503).json({ok:false,error:'BROWSERLESS_NOT_CONFIGURED'});
       const browser=await openRemoteBrowser();
       try{
         const page=await getPage(browser);
-        const raw=await scrapeLigue1Maggle(page);
         let events=[];
         try{ events=await fetchParionsL1EventsHttp(); }
         catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }
+        const raw=await scrapeLigue1Maggle(page,events);
         const data=attachParionsNumbers(raw,events);
         const pickCounts={};
         for(const m of data.matchs||[]) for(const [player,pick] of Object.entries(m.pronostics||{})) if(['1','N','2'].includes(pick)) pickCounts[player]=(pickCounts[player]||0)+1;
-        return res.status(200).json({ok:true,version:'11.4.24',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
+        return res.status(200).json({ok:true,version:'11.4.25',journee:data.journee,classement:data.classement,matches:(data.matchs||[]).map(m=>({home:m.domicile,away:m.exterieur,eventNumber:m.eventNumber,parionsMatch:m.parionsMatch,validPicks:Object.values(m.pronostics||{}).filter(x=>['1','N','2'].includes(x)).length})),parionsEvents:data.parionsEvents,mappingDiagnostics:data.mappingDiagnostics,pickCounts});
       }finally{ await browser.close().catch(()=>{}); }
     }
     if(req.method!=='POST') return res.status(405).json({ok:false,error:'POST requis'});
@@ -1028,11 +1103,15 @@ export default async function handler(req,res){
     try{
       const page=await getPage(browser);
       if(action==='sync'){
-        const data=await scrapeLigue1Maggle(page);
         let events=[];
         try{ events=await fetchParionsL1EventsHttp(); }
         catch(e){ console.error('PARIONS_MAPPING_HTTP_FAILED '+String(e?.message||e)); }
-        return res.status(200).json({ok:true,data:attachParionsNumbers(data,events)});
+        const data=await scrapeLigue1Maggle(page,events);
+        const mapped=attachParionsNumbers(data,events);
+        if(events.length && mapped.mappingDiagnostics?.mapped<5){
+          throw new Error(`Synchronisation Ligue1Maggle incohérente : seulement ${mapped.mappingDiagnostics?.mapped||0}/${mapped.matchs?.length||0} match(s) correspondent aux paris Ligue 1 actuellement ouverts.`);
+        }
+        return res.status(200).json({ok:true,data:mapped});
       }
       if(action==='create-bulletin'){
         const bets=req.body?.bets; if(!Array.isArray(bets)||!bets.length) return res.status(400).json({ok:false,error:'Aucun pari reçu'});
